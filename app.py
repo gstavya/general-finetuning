@@ -175,7 +175,18 @@ def main():
             print(f"Epoch {epoch+1} - Average Loss: {avg_loss:.4f}")
 
     # 5. Save the final backbone
-    torch.save(model.backbone.state_dict(), "byol_resnet50_backbone_patched.pth")
+    OUTPUT_DIR = "/mnt/satellite-resnet"
+
+    # Create the directory if it doesn't exist, just in case
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    
+    # Define the full path for the saved model
+    save_path = os.path.join(OUTPUT_DIR, "byol_resnet50_backbone_patched.pth")
+    
+    # Save the model to the persistent storage
+    torch.save(model.backbone.state_dict(), save_path)
+    
+    print(f"✅ Training complete. Backbone saved to persistent storage at: {save_path}")
     print("✅ Training complete. Backbone saved to byol_resnet50_backbone_patched.pth")
 
 
