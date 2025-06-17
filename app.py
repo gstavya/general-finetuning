@@ -9,59 +9,79 @@ from lightly.transforms import BYOLTransform
 from tqdm import tqdm
 import os
 from PIL import Image
+import io  # NEW: Required for reading image bytes from memory
+
+# NEW: Import the Azure Blob Storage client library
+from azure.storage.blob import BlobServiceClient
 
 # Allow loading of large images that might otherwise raise an error
 Image.MAX_IMAGE_PIXELS = None
 
 # --------------------------------------------------------------------------------
-# ✅ Preprocessing Function (No changes needed here, it's generic)
+# ✅ MODIFIED: Function to download and preprocess from Azure Blob Storage
 # --------------------------------------------------------------------------------
-def preprocess_and_save_patches(source_dir, target_dir, patch_size=224):
+def download_and_preprocess_from_azure(connection_string, container_name, target_dir, patch_size=224):
     """
-    Checks if patches exist in the target directory. If not, it splits images 
-    from the source directory and saves them to the target directory.
+    Connects to Azure Blob Storage, downloads images, splits them into patches,
+    and saves them to a local target directory.
 
     Args:
-        source_dir (str): The directory containing the original large images.
-        target_dir (str): The directory where pre-split patches will be saved.
+        connection_string (str): The connection string for the Azure Storage Account.
+        container_name (str): The name of the container holding the images.
+        target_dir (str): The local directory where pre-split patches will be saved.
         patch_size (int): The height and width of the square patches.
     """
     if os.path.exists(target_dir) and len(os.listdir(target_dir)) > 0:
         print(f"Patches already exist in persistent storage ('{target_dir}'). Skipping preprocessing.")
         return
 
-    print(f"Reading images from source ('{source_dir}') and saving patches to persistent storage ('{target_dir}')...")
+    print(f"Connecting to Azure Blob Storage container '{container_name}'...")
+    print(f"Downloading images and saving patches to persistent storage ('{target_dir}')...")
     os.makedirs(target_dir, exist_ok=True)
 
     try:
-        image_paths = [os.path.join(source_dir, fname) for fname in os.listdir(source_dir)
-                       if fname.lower().endswith(('png', 'jpg', 'jpeg', 'bmp', 'gif'))]
-        if not image_paths:
-            print(f"Warning: No images found in the source directory '{source_dir}'.")
+        # Initialize the BlobServiceClient
+        blob_service_client = BlobServiceClient.from_connection_string(connection_string)
+        container_client = blob_service_client.get_container_client(container_name)
+
+        blob_list = container_client.list_blobs()
+        
+        # Filter for common image file extensions
+        image_blobs = [blob for blob in blob_list if blob.name.lower().endswith(('png', 'jpg', 'jpeg', 'bmp', 'gif'))]
+
+        if not image_blobs:
+            print(f"Warning: No images found in the Azure container '{container_name}'.")
             return
-    except FileNotFoundError:
-        print(f"Error: The source directory '{source_dir}' was not found. Please ensure it's in your repository.")
-        return
 
+        for blob in tqdm(image_blobs, desc="Downloading & Saving Patches"):
+            try:
+                # Download blob content into memory
+                blob_client = container_client.get_blob_client(blob.name)
+                downloader = blob_client.download_blob()
+                image_bytes = downloader.readall()
 
-    for image_path in tqdm(image_paths, desc="Saving Patches to Persistent Storage"):
-        try:
-            with Image.open(image_path) as img:
-                width, height = img.size
-                patch_num = 0
-                for y in range(0, height - patch_size + 1, patch_size):
-                    for x in range(0, width - patch_size + 1, patch_size):
-                        box = (x, y, x + patch_size, y + patch_size)
-                        patch = img.crop(box)
+                # Open the image from the in-memory bytes
+                with Image.open(io.BytesIO(image_bytes)) as img:
+                    width, height = img.size
+                    patch_num = 0
+                    for y in range(0, height - patch_size + 1, patch_size):
+                        for x in range(0, width - patch_size + 1, patch_size):
+                            box = (x, y, x + patch_size, y + patch_size)
+                            patch = img.crop(box)
 
-                        original_filename = os.path.splitext(os.path.basename(image_path))[0]
-                        patch_filename = f"{original_filename}_patch_{patch_num}.png"
-                        save_path = os.path.join(target_dir, patch_filename)
-                        
-                        patch.convert('RGB').save(save_path)
-                        patch_num += 1
-        except Exception as e:
-            print(f"Warning: Could not process {image_path}. Skipping. Error: {e}")
+                            original_filename = os.path.splitext(blob.name)[0].replace("/", "_")
+                            patch_filename = f"{original_filename}_patch_{patch_num}.png"
+                            save_path = os.path.join(target_dir, patch_filename)
+                            
+                            patch.convert('RGB').save(save_path)
+                            patch_num += 1
+            except Exception as e:
+                print(f"Warning: Could not process blob {blob.name}. Skipping. Error: {e}")
+
+    except Exception as e:
+        print(f"FATAL: An error occurred while connecting to or reading from Azure: {e}")
+        print("Please ensure your AZURE_STORAGE_CONNECTION_STRING is set correctly.")
+        raise
 
 # --------------------------------------------------------------------------------
 # ✅ Dataset for Pre-split Patches (No changes needed here)
@@ -90,10 +110,11 @@ class PatchedImageDataset(Dataset):
 
 def main():
     # --- Configuration ---
-    # ✅ Correctly define source and persistent directories
-    # This is your local folder from the GitHub repository
-    SOURCE_GITHUB_DIR = 'data' 
-    # This is the persistent storage provided by ML Foundry
+    # ✅ MODIFIED: Azure Storage Configuration
+    AZURE_ACCOUNT_NAME = "resnettrainingdata"
+    AZURE_CONTAINER_NAME = "data"
+    
+    # This is the persistent storage provided by your ML platform
     PERSISTENT_PATCH_DIR = '/mnt/data' 
     
     PATCH_SIZE = 224
@@ -110,19 +131,30 @@ def main():
     LR = 1e-3
 
     print(f"Using device: {DEVICE}")
-    print(f"Source Image Directory: '{SOURCE_GITHUB_DIR}' (from GitHub repo)")
-    print(f"Persistent Patch Storage: '{PERSISTENT_PATCH_DIR}' (in ML Foundry storage)")
+    print(f"Sourcing images from Azure Blob Storage: '{AZURE_ACCOUNT_NAME}/{AZURE_CONTAINER_NAME}'")
+    print(f"Persistent Patch Storage: '{PERSISTENT_PATCH_DIR}'")
 
-    # ✅ Run Preprocessing Step
-    # This reads from your Git folder and saves to the persistent /mnt/data folder.
+    # ✅ MODIFIED: Get connection string from environment variable for security
+    connection_string = os.environ.get('AZURE_STORAGE_CONNECTION_STRING')
+    if not connection_string:
+        print("FATAL: Environment variable 'AZURE_STORAGE_CONNECTION_STRING' not set.")
+        print("Please set this secret in your ML platform's environment settings.")
+        return
+
+    # ✅ MODIFIED: Run Preprocessing Step from Azure
+    # This reads from Azure and saves to the persistent /mnt/data folder.
     # It will only run the first time.
-    preprocess_and_save_patches(SOURCE_GITHUB_DIR, PERSISTENT_PATCH_DIR, PATCH_SIZE)
+    download_and_preprocess_from_azure(
+        connection_string=DefaultEndpointsProtocol=https;AccountName=resnettrainingdata;AccountKey=afq0lgt0sj3lq1+b3Y6eeIg+JArkqE5UJL7tHSeM+Bxa0S3aQSK9ZRMZHozG1PJx2rGfwBh7DySr+ASt3w6JmA==;EndpointSuffix=core.windows.net,
+        container_name=AZURE_CONTAINER_NAME,
+        target_dir=PERSISTENT_PATCH_DIR,
+        patch_size=PATCH_SIZE
+    )
 
     # ✅ 1. Load and augment dataset FROM THE PERSISTENT STORAGE directory
     transform = BYOLTransform(input_size=PATCH_SIZE)
 
     try:
-        # The dataset now correctly points to the persistent patch directory
         dataset = PatchedImageDataset(root_dir=PERSISTENT_PATCH_DIR, transform=transform)
         if len(dataset) == 0:
             print(f"Error: No preprocessed patches found in '{PERSISTENT_PATCH_DIR}'. Preprocessing may have failed.")
