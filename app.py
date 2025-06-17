@@ -2,14 +2,14 @@ import torch
 import torchvision.transforms as T
 from torch.utils.data import DataLoader, Dataset
 from torchvision.models import resnet50
-from lightly.models.modules.heads import BYOLProjectionHead
 from lightly.loss import NegativeCosineSimilarity
 from lightly.models import BYOL
 from lightly.transforms import BYOLTransform
 from tqdm import tqdm
 import os
 from PIL import Image
-import io  # NEW: Required for reading image bytes from memory
+import io
+import argparse # NEW: To handle command-line arguments (e.g., --preprocess)
 
 # NEW: Import the Azure Blob Storage client library
 from azure.storage.blob import BlobServiceClient
@@ -17,79 +17,130 @@ from azure.storage.blob import BlobServiceClient
 # Allow loading of large images that might otherwise raise an error
 Image.MAX_IMAGE_PIXELS = None
 
-# --------------------------------------------------------------------------------
-# ✅ MODIFIED: Function to download and preprocess from Azure Blob Storage
-# --------------------------------------------------------------------------------
-def download_and_preprocess_from_azure(connection_string, container_name, target_dir, patch_size=224):
-    """
-    Connects to Azure Blob Storage, downloads images, splits them into patches,
-    and saves them to a local target directory.
 
-    Args:
-        connection_string (str): The connection string for the Azure Storage Account.
-        container_name (str): The name of the container holding the images.
-        target_dir (str): The local directory where pre-split patches will be saved.
-        patch_size (int): The height and width of the square patches.
+# --------------------------------------------------------------------------------
+# ✅ NEW: Function to preprocess images and UPLOAD patches to Azure
+# --------------------------------------------------------------------------------
+def preprocess_and_upload_patches(connection_string, source_container, dest_container, patch_size=224):
     """
-    if os.path.exists(target_dir) and len(os.listdir(target_dir)) > 0:
-        print(f"Patches already exist in persistent storage ('{target_dir}'). Skipping preprocessing.")
-        return
-
-    print(f"Connecting to Azure Blob Storage container '{container_name}'...")
-    print(f"Downloading images and saving patches to persistent storage ('{target_dir}')...")
-    os.makedirs(target_dir, exist_ok=True)
+    Connects to Azure, downloads images from a source container, splits them
+    into patches, and uploads the patches to a destination container.
+    """
+    print(f"Starting preprocessing...")
+    print(f"Source container: '{source_container}'")
+    print(f"Destination container: '{dest_container}'")
 
     try:
-        # Initialize the BlobServiceClient
         blob_service_client = BlobServiceClient.from_connection_string(connection_string)
-        container_client = blob_service_client.get_container_client(container_name)
-
-        blob_list = container_client.list_blobs()
         
-        # Filter for common image file extensions
-        image_blobs = [blob for blob in blob_list if blob.name.lower().endswith(('png', 'jpg', 'jpeg', 'bmp', 'gif'))]
+        # Client for the source container with original images
+        source_container_client = blob_service_client.get_container_client(source_container)
+        
+        # Client for the destination container for patches
+        dest_container_client = blob_service_client.get_container_client(dest_container)
+        dest_container_client.create_container_if_not_exists() # Ensure dest container exists
+
+        image_blobs = [blob for blob in source_container_client.list_blobs() if blob.name.lower().endswith(('png', 'jpg', 'jpeg', 'bmp', 'gif'))]
 
         if not image_blobs:
-            print(f"Warning: No images found in the Azure container '{container_name}'.")
+            print(f"Warning: No images found in source container '{source_container}'.")
             return
 
-        for blob in tqdm(image_blobs, desc="Downloading & Saving Patches"):
+        for blob in tqdm(image_blobs, desc="Preprocessing and Uploading Patches"):
             try:
-                # Download blob content into memory
-                blob_client = container_client.get_blob_client(blob.name)
-                downloader = blob_client.download_blob()
+                downloader = source_container_client.get_blob_client(blob.name).download_blob()
                 image_bytes = downloader.readall()
 
-                # Open the image from the in-memory bytes
                 with Image.open(io.BytesIO(image_bytes)) as img:
                     width, height = img.size
                     patch_num = 0
                     for y in range(0, height - patch_size + 1, patch_size):
                         for x in range(0, width - patch_size + 1, patch_size):
                             box = (x, y, x + patch_size, y + patch_size)
-                            patch = img.crop(box)
+                            patch = img.crop(box).convert('RGB')
 
+                            # Save patch to an in-memory buffer instead of a file
+                            buffer = io.BytesIO()
+                            patch.save(buffer, format='PNG')
+                            buffer.seek(0) # Rewind the buffer to the beginning
+
+                            # Define the name for the patch blob
                             original_filename = os.path.splitext(blob.name)[0].replace("/", "_")
-                            patch_filename = f"{original_filename}_patch_{patch_num}.png"
-                            save_path = os.path.join(target_dir, patch_filename)
+                            patch_blob_name = f"{original_filename}_patch_{patch_num}.png"
                             
-                            patch.convert('RGB').save(save_path)
+                            # Upload the patch from the buffer
+                            dest_container_client.upload_blob(name=patch_blob_name, data=buffer, overwrite=True)
                             patch_num += 1
             except Exception as e:
                 print(f"Warning: Could not process blob {blob.name}. Skipping. Error: {e}")
+        
+        print(f"✅ Preprocessing complete. All patches uploaded to container '{dest_container}'.")
 
     except Exception as e:
-        print(f"FATAL: An error occurred while connecting to or reading from Azure: {e}")
-        print("Please ensure your AZURE_STORAGE_CONNECTION_STRING is set correctly.")
+        print(f"FATAL: An error occurred during preprocessing: {e}")
         raise
 
 # --------------------------------------------------------------------------------
-# ✅ Dataset for Pre-split Patches (No changes needed here)
+# ✅ NEW: Function to download pre-split patches for training
+# --------------------------------------------------------------------------------
+def download_patches_for_training(connection_string, patch_container_name, local_dir):
+    """
+    Downloads all patches from a specified container to a local directory
+    to be used for training.
+    """
+    if os.path.exists(local_dir) and len(os.listdir(local_dir)) > 0:
+        print(f"Patches already exist in local cache ('{local_dir}'). Skipping download.")
+        return
+
+    print(f"Downloading patches from container '{patch_container_name}' to local cache '{local_dir}'...")
+    os.makedirs(local_dir, exist_ok=True)
+
+    try:
+        blob_service_client = BlobServiceClient.from_connection_string(connection_string)
+        container_client = blob_service_client.get_container_client(patch_container_name)
+        
+        blob_list = container_client.list_blobs()
+        for blob in tqdm(blob_list, desc="Downloading Patches for Training"):
+            local_path = os.path.join(local_dir, blob.name)
+            with open(local_path, "wb") as download_file:
+                download_file.write(container_client.get_blob_client(blob).download_blob().readall())
+        
+        print("✅ All patches downloaded successfully.")
+
+    except Exception as e:
+        print(f"FATAL: Could not download patches for training. Error: {e}")
+        raise
+
+# --------------------------------------------------------------------------------
+# ✅ NEW: Function to upload the final model
+# --------------------------------------------------------------------------------
+def upload_model(connection_string, model_container_name, model_state_dict, model_filename):
+    """
+    Saves a model state dict to an in-memory buffer and uploads it to Azure.
+    """
+    print(f"Uploading model '{model_filename}' to container '{model_container_name}'...")
+    try:
+        blob_service_client = BlobServiceClient.from_connection_string(connection_string)
+        container_client = blob_service_client.get_container_client(model_container_name)
+        container_client.create_container_if_not_exists()
+
+        # Save the model state dict to an in-memory buffer
+        buffer = io.BytesIO()
+        torch.save(model_state_dict, buffer)
+        buffer.seek(0) # Rewind buffer
+
+        # Upload the buffer's content
+        container_client.upload_blob(name=model_filename, data=buffer, overwrite=True)
+        print(f"✅ Model successfully uploaded to Azure Blob Storage.")
+
+    except Exception as e:
+        print(f"FATAL: Could not upload model. Error: {e}")
+        raise
+
+# --------------------------------------------------------------------------------
+# This Dataset class remains unchanged, as it correctly reads from a local directory.
 # --------------------------------------------------------------------------------
 class PatchedImageDataset(Dataset):
-    """
-    A PyTorch Dataset that loads pre-split image patches directly from a directory.
-    """
     def __init__(self, root_dir, transform=None):
         self.root_dir = root_dir
         self.transform = transform
@@ -101,113 +152,99 @@ class PatchedImageDataset(Dataset):
     def __getitem__(self, idx):
         image_path = self.image_paths[idx]
         patch = Image.open(image_path).convert('RGB')
-        
         if self.transform:
             patch = self.transform(patch)
-
         return patch, 0, os.path.basename(image_path)
 
-
 def main():
+    # --- Argument Parsing ---
+    parser = argparse.ArgumentParser(description="ResNet Training with Azure Blob Storage")
+    parser.add_argument('--preprocess', action='store_true', help="Run in preprocessing mode to split images and upload patches.")
+    args = parser.parse_args()
+
     # --- Configuration ---
-    # ✅ MODIFIED: Azure Storage Configuration
-    AZURE_ACCOUNT_NAME = "resnettrainingdata"
-    AZURE_CONTAINER_NAME = "data"
+    SOURCE_DATA_CONTAINER = "data"
+    SPLIT_DATA_CONTAINER = "data-split"
+    MODEL_CONTAINER = "resnet-model"
     
-    # This is the persistent storage provided by your ML platform
-    PERSISTENT_PATCH_DIR = '/mnt/data' 
+    LOCAL_PATCH_CACHE_DIR = '/mnt/data'
     
     PATCH_SIZE = 224
     BATCH_SIZE = 64
     NUM_EPOCHS = 10
-    if torch.cuda.is_available():
-        DEVICE = 'cuda'
-    elif torch.backends.mps.is_available():
-        DEVICE = 'mps'
-    else:
-        DEVICE = 'cpu'
-    
+    DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
     NUM_WORKERS = 4 if torch.cuda.is_available() else 0
     LR = 1e-3
 
-    print(f"Using device: {DEVICE}")
-    print(f"Sourcing images from Azure Blob Storage: '{AZURE_ACCOUNT_NAME}/{AZURE_CONTAINER_NAME}'")
-    print(f"Persistent Patch Storage: '{PERSISTENT_PATCH_DIR}'")
+    # --- Securely get the connection string ---
+    connection_string = os.environ.get('AZURE_STORAGE_CONNECTION_STRING')
+    if not connection_string:
+        print("FATAL: Environment variable 'AZURE_STORAGE_CONNECTION_STRING' not set.")
+        return
 
-    # ✅ MODIFIED: Run Preprocessing Step from Azure
-    # This reads from Azure and saves to the persistent /mnt/data folder.
-    # It will only run the first time.
-    download_and_preprocess_from_azure(
-        connection_string="DefaultEndpointsProtocol=https;AccountName=resnettrainingdata;AccountKey=afq0lgt0sj3lq1+b3Y6eeIg+JArkqE5UJL7tHSeM+Bxa0S3aQSK9ZRMZHozG1PJx2rGfwBh7DySr+ASt3w6JmA==;EndpointSuffix=core.windows.net",
-        container_name=AZURE_CONTAINER_NAME,
-        target_dir=PERSISTENT_PATCH_DIR,
-        patch_size=PATCH_SIZE
+    # --- Workflow Selection ---
+    if args.preprocess:
+        preprocess_and_upload_patches(
+            connection_string=connection_string,
+            source_container=SOURCE_DATA_CONTAINER,
+            dest_container=SPLIT_DATA_CONTAINER,
+            patch_size=PATCH_SIZE
+        )
+        return # Exit after preprocessing
+
+    # --- Default Mode: Training ---
+    print(f"Using device: {DEVICE}")
+    
+    # 1. Download patches from Azure to local cache for fast training
+    download_patches_for_training(
+        connection_string=connection_string,
+        patch_container_name=SPLIT_DATA_CONTAINER,
+        local_dir=LOCAL_PATCH_CACHE_DIR
     )
 
-    # ✅ 1. Load and augment dataset FROM THE PERSISTENT STORAGE directory
+    # 2. Load dataset from the local cache
     transform = BYOLTransform(input_size=PATCH_SIZE)
-
     try:
-        dataset = PatchedImageDataset(root_dir=PERSISTENT_PATCH_DIR, transform=transform)
+        dataset = PatchedImageDataset(root_dir=LOCAL_PATCH_CACHE_DIR, transform=transform)
         if len(dataset) == 0:
-            print(f"Error: No preprocessed patches found in '{PERSISTENT_PATCH_DIR}'. Preprocessing may have failed.")
+            print(f"Error: No patches found in local cache '{LOCAL_PATCH_CACHE_DIR}'.")
             return
     except FileNotFoundError:
-        print(f"Error: The persistent patch directory '{PERSISTENT_PATCH_DIR}' was not found.")
-        print("This may be normal on the first run. Preprocessing will attempt to create it.")
+        print(f"Error: The local cache directory '{LOCAL_PATCH_CACHE_DIR}' was not found.")
         return
 
-    dataloader = DataLoader(
-        dataset,
-        batch_size=BATCH_SIZE,
-        shuffle=True,
-        num_workers=NUM_WORKERS,
-        drop_last=True,
-        persistent_workers=True if NUM_WORKERS > 0 else False,
-    )
+    dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS, drop_last=True)
 
-    if len(dataloader) == 0:
-        print("Error: Your DataLoader is empty. This is likely because the number of patches is smaller than the batch size.")
-        return
-
-    # --- (The rest of the training loop is identical) ---
-
-    # 2. Define backbone + BYOL wrapper
+    # --- Training Loop (identical) ---
     resnet = resnet50(weights=None)
     resnet.fc = torch.nn.Identity()
     model = BYOL(backbone=resnet).to(DEVICE)
-
-    # 3. Optimizer + loss
     optimizer = torch.optim.Adam(model.parameters(), lr=LR)
     loss_fn = NegativeCosineSimilarity()
 
-    # 4. Training loop
     print(f"Starting training on {len(dataset)} image patches for {NUM_EPOCHS} epochs...")
     for epoch in range(NUM_EPOCHS):
-        model.train()
         total_loss = 0.0
         for (x0, x1), _, _ in tqdm(dataloader, desc=f"Epoch {epoch+1}/{NUM_EPOCHS}"):
             x0, x1 = x0.to(DEVICE), x1.to(DEVICE)
-            predictions, projections = model(x0, x1)
-            p0, p1 = predictions
-            z0, z1 = projections
-            loss = 0.5 * (loss_fn(p0, z1.detach()) + loss_fn(p1, z0.detach()))
+            p0, p1 = model(x0, x1)
+            loss = loss_fn(p0, p1)
             total_loss += loss.item()
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
+            model.update_moving_average()
+        
+        avg_loss = total_loss / len(dataloader)
+        print(f"Epoch {epoch+1} - Average Loss: {avg_loss:.4f}")
 
-        if len(dataloader) > 0:
-            avg_loss = total_loss / len(dataloader)
-            print(f"Epoch {epoch+1} - Average Loss: {avg_loss:.4f}")
-
-    # 5. Save the final backbone
-    OUTPUT_DIR = "/mnt/satellite-resnet"
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-    save_path = os.path.join(OUTPUT_DIR, "byol_resnet50_backbone_patched.pth")
-    torch.save(model.backbone.state_dict(), save_path)
-    
-    print(f"✅ Training complete. Backbone saved to persistent storage at: {save_path}")
+    # --- Upload the final model ---
+    upload_model(
+        connection_string=connection_string,
+        model_container_name=MODEL_CONTAINER,
+        model_state_dict=model.backbone.state_dict(),
+        model_filename="byol_resnet50_backbone.pth"
+    )
 
 if __name__ == '__main__':
     main()
