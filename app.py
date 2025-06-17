@@ -134,13 +134,6 @@ def main():
     print(f"Sourcing images from Azure Blob Storage: '{AZURE_ACCOUNT_NAME}/{AZURE_CONTAINER_NAME}'")
     print(f"Persistent Patch Storage: '{PERSISTENT_PATCH_DIR}'")
 
-    # ✅ MODIFIED: Get connection string from environment variable for security
-    connection_string = os.environ.get('AZURE_STORAGE_CONNECTION_STRING')
-    if not connection_string:
-        print("FATAL: Environment variable 'AZURE_STORAGE_CONNECTION_STRING' not set.")
-        print("Please set this secret in your ML platform's environment settings.")
-        return
-
     # ✅ MODIFIED: Run Preprocessing Step from Azure
     # This reads from Azure and saves to the persistent /mnt/data folder.
     # It will only run the first time.
