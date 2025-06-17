@@ -14,74 +14,88 @@ from PIL import Image
 Image.MAX_IMAGE_PIXELS = None
 
 # --------------------------------------------------------------------------------
-# ✅ Custom Dataset for Splitting Images into Patches (This part is correct)
+# ✅ Preprocessing Function (No changes needed here, it's generic)
 # --------------------------------------------------------------------------------
-class ImagePatchDataset(Dataset):
+def preprocess_and_save_patches(source_dir, target_dir, patch_size=224):
     """
-    Custom PyTorch Dataset to split large images into smaller patches.
+    Checks if patches exist in the target directory. If not, it splits images 
+    from the source directory and saves them to the target directory.
 
-    This dataset scans a directory of images. For each image, it calculates
-    all possible non-overlapping patches of a given size. The __getitem__ method
-    then crops and returns a specific patch, to which data augmentations
-    (like the BYOL transform) can be applied.
+    Args:
+        source_dir (str): The directory containing the original large images.
+        target_dir (str): The directory where pre-split patches will be saved.
+        patch_size (int): The height and width of the square patches.
     """
-    def __init__(self, root_dir, patch_size=224, transform=None):
-        """
-        Args:
-            root_dir (str): Directory with all the images.
-            patch_size (int): The height and width of the square patches.
-            transform (callable, optional): Optional transform to be applied on a patch.
-        """
+    if os.path.exists(target_dir) and len(os.listdir(target_dir)) > 0:
+        print(f"Patches already exist in persistent storage ('{target_dir}'). Skipping preprocessing.")
+        return
+
+    print(f"Reading images from source ('{source_dir}') and saving patches to persistent storage ('{target_dir}')...")
+    os.makedirs(target_dir, exist_ok=True)
+
+    try:
+        image_paths = [os.path.join(source_dir, fname) for fname in os.listdir(source_dir)
+                       if fname.lower().endswith(('png', 'jpg', 'jpeg', 'bmp', 'gif'))]
+        if not image_paths:
+            print(f"Warning: No images found in the source directory '{source_dir}'.")
+            return
+    except FileNotFoundError:
+        print(f"Error: The source directory '{source_dir}' was not found. Please ensure it's in your repository.")
+        return
+
+
+    for image_path in tqdm(image_paths, desc="Saving Patches to Persistent Storage"):
+        try:
+            with Image.open(image_path) as img:
+                width, height = img.size
+                patch_num = 0
+                for y in range(0, height - patch_size + 1, patch_size):
+                    for x in range(0, width - patch_size + 1, patch_size):
+                        box = (x, y, x + patch_size, y + patch_size)
+                        patch = img.crop(box)
+
+                        original_filename = os.path.splitext(os.path.basename(image_path))[0]
+                        patch_filename = f"{original_filename}_patch_{patch_num}.png"
+                        save_path = os.path.join(target_dir, patch_filename)
+                        
+                        patch.convert('RGB').save(save_path)
+                        patch_num += 1
+        except Exception as e:
+            print(f"Warning: Could not process {image_path}. Skipping. Error: {e}")
+
+# --------------------------------------------------------------------------------
+# ✅ Dataset for Pre-split Patches (No changes needed here)
+# --------------------------------------------------------------------------------
+class PatchedImageDataset(Dataset):
+    """
+    A PyTorch Dataset that loads pre-split image patches directly from a directory.
+    """
+    def __init__(self, root_dir, transform=None):
         self.root_dir = root_dir
-        self.patch_size = patch_size
         self.transform = transform
-        self.image_paths = [os.path.join(root_dir, fname) for fname in os.listdir(root_dir)
-                            if fname.lower().endswith(('png', 'jpg', 'jpeg', 'bmp', 'gif'))]
-        
-        self.patches_map = []
-        print("Pre-calculating image patches...")
-        # Create a map of all possible patches from all images
-        for image_path in tqdm(self.image_paths, desc="Scanning Images"):
-            try:
-                with Image.open(image_path) as img:
-                    width, height = img.size
-                    # Calculate how many patches fit in the image
-                    for y in range(0, height - self.patch_size + 1, self.patch_size):
-                        for x in range(0, width - self.patch_size + 1, self.patch_size):
-                            # Store the path and the top-left coordinate of the patch
-                            self.patches_map.append((image_path, x, y))
-            except Exception as e:
-                print(f"Warning: Could not read or process {image_path}. Skipping. Error: {e}")
+        self.image_paths = [os.path.join(root_dir, fname) for fname in os.listdir(root_dir)]
 
     def __len__(self):
-        """Returns the total number of patches."""
-        return len(self.patches_map)
+        return len(self.image_paths)
 
     def __getitem__(self, idx):
-        """
-        Retrieves the patch at the given index, crops it, and applies transforms.
-        """
-        # Get the image path and patch coordinates from our map
-        image_path, x, y = self.patches_map[idx]
+        image_path = self.image_paths[idx]
+        patch = Image.open(image_path).convert('RGB')
         
-        # Open the original large image
-        original_image = Image.open(image_path).convert('RGB')
-        
-        # Define the crop box and extract the patch
-        box = (x, y, x + self.patch_size, y + self.patch_size)
-        patch = original_image.crop(box)
-        
-        # Apply the BYOL augmentations to the patch
         if self.transform:
             patch = self.transform(patch)
 
-        # Return the transformed patch and dummy data to match dataloader expectations
-        # The BYOL transform returns two augmented views (x0, x1) of the patch
         return patch, 0, os.path.basename(image_path)
+
 
 def main():
     # --- Configuration ---
-    DATA_DIR = 'data'
+    # ✅ Correctly define source and persistent directories
+    # This is your local folder from the GitHub repository
+    SOURCE_GITHUB_DIR = 'data' 
+    # This is the persistent storage provided by ML Foundry
+    PERSISTENT_PATCH_DIR = '/mnt/data' 
+    
     PATCH_SIZE = 224
     BATCH_SIZE = 64
     NUM_EPOCHS = 10
@@ -96,19 +110,26 @@ def main():
     LR = 1e-3
 
     print(f"Using device: {DEVICE}")
+    print(f"Source Image Directory: '{SOURCE_GITHUB_DIR}' (from GitHub repo)")
+    print(f"Persistent Patch Storage: '{PERSISTENT_PATCH_DIR}' (in ML Foundry storage)")
 
-    # 1. Load and augment dataset using our new patch-based dataset
-    # The default BYOLTransform is already set for an input size of 224
-    transform = BYOLTransform()
+    # ✅ Run Preprocessing Step
+    # This reads from your Git folder and saves to the persistent /mnt/data folder.
+    # It will only run the first time.
+    preprocess_and_save_patches(SOURCE_GITHUB_DIR, PERSISTENT_PATCH_DIR, PATCH_SIZE)
+
+    # ✅ 1. Load and augment dataset FROM THE PERSISTENT STORAGE directory
+    transform = BYOLTransform(input_size=PATCH_SIZE)
 
     try:
-        dataset = ImagePatchDataset(root_dir=DATA_DIR, patch_size=PATCH_SIZE, transform=transform)
+        # The dataset now correctly points to the persistent patch directory
+        dataset = PatchedImageDataset(root_dir=PERSISTENT_PATCH_DIR, transform=transform)
         if len(dataset) == 0:
-            print(f"Error: No images found or no patches could be created in the '{DATA_DIR}' directory.")
-            print("Please ensure your images are larger than the patch size of 224x224.")
+            print(f"Error: No preprocessed patches found in '{PERSISTENT_PATCH_DIR}'. Preprocessing may have failed.")
             return
     except FileNotFoundError:
-        print(f"Error: The directory '{DATA_DIR}' was not found.")
+        print(f"Error: The persistent patch directory '{PERSISTENT_PATCH_DIR}' was not found.")
+        print("This may be normal on the first run. Preprocessing will attempt to create it.")
         return
 
     dataloader = DataLoader(
@@ -121,22 +142,15 @@ def main():
     )
 
     if len(dataloader) == 0:
-        print("---")
-        print("Error: Your DataLoader is empty.")
-        print(f"This is likely because your total number of patches ({len(dataset)}) is smaller than your BATCH_SIZE ({BATCH_SIZE}).")
-        print("\nPossible Solutions:")
-        print("1. Add more/larger images to your dataset to generate more patches.")
-        print(f"2. Decrease your BATCH_SIZE to be <= {len(dataset)}.")
-        print("---")
+        print("Error: Your DataLoader is empty. This is likely because the number of patches is smaller than the batch size.")
         return
+
+    # --- (The rest of the training loop is identical) ---
 
     # 2. Define backbone + BYOL wrapper
     resnet = resnet50(weights=None)
     resnet.fc = torch.nn.Identity()
-
-    model = BYOL(
-        backbone=resnet
-    ).to(DEVICE)
+    model = BYOL(backbone=resnet).to(DEVICE)
 
     # 3. Optimizer + loss
     optimizer = torch.optim.Adam(model.parameters(), lr=LR)
@@ -149,26 +163,14 @@ def main():
         total_loss = 0.0
         for (x0, x1), _, _ in tqdm(dataloader, desc=f"Epoch {epoch+1}/{NUM_EPOCHS}"):
             x0, x1 = x0.to(DEVICE), x1.to(DEVICE)
-
-            # --------------------------------------------------------------------
-            # ✅ FIX: Call the model directly to perform the forward pass.
-            # --------------------------------------------------------------------
             predictions, projections = model(x0, x1)
             p0, p1 = predictions
             z0, z1 = projections
-            
-            # Calculate the symmetric loss.
-            # We detach the target projections (z0, z1) to stop gradients.
             loss = 0.5 * (loss_fn(p0, z1.detach()) + loss_fn(p1, z0.detach()))
-            # --------------------------------------------------------------------
-
             total_loss += loss.item()
-
-            # Backward pass
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
-            # model.update_moving_average()
 
         if len(dataloader) > 0:
             avg_loss = total_loss / len(dataloader)
@@ -176,19 +178,11 @@ def main():
 
     # 5. Save the final backbone
     OUTPUT_DIR = "/mnt/satellite-resnet"
-
-    # Create the directory if it doesn't exist, just in case
     os.makedirs(OUTPUT_DIR, exist_ok=True)
-    
-    # Define the full path for the saved model
     save_path = os.path.join(OUTPUT_DIR, "byol_resnet50_backbone_patched.pth")
-    
-    # Save the model to the persistent storage
     torch.save(model.backbone.state_dict(), save_path)
     
     print(f"✅ Training complete. Backbone saved to persistent storage at: {save_path}")
-    print("✅ Training complete. Backbone saved to byol_resnet50_backbone_patched.pth")
-
 
 if __name__ == '__main__':
     main()
