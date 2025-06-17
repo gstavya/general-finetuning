@@ -177,10 +177,7 @@ def main():
     LR = 1e-3
 
     # --- Securely get the connection string ---
-    connection_string = os.environ.get('AZURE_STORAGE_CONNECTION_STRING')
-    if not connection_string:
-        print("FATAL: Environment variable 'AZURE_STORAGE_CONNECTION_STRING' not set.")
-        return
+    connection_string = "DefaultEndpointsProtocol=https;AccountName=resnettrainingdata;AccountKey=afq0lgt0sj3lq1+b3Y6eeIg+JArkqE5UJL7tHSeM+Bxa0S3aQSK9ZRMZHozG1PJx2rGfwBh7DySr+ASt3w6JmA==;EndpointSuffix=core.windows.net"
 
     # --- Workflow Selection ---
     if args.preprocess:
