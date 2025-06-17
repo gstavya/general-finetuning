@@ -145,7 +145,7 @@ def main():
     # This reads from Azure and saves to the persistent /mnt/data folder.
     # It will only run the first time.
     download_and_preprocess_from_azure(
-        connection_string=DefaultEndpointsProtocol=https;AccountName=resnettrainingdata;AccountKey=afq0lgt0sj3lq1+b3Y6eeIg+JArkqE5UJL7tHSeM+Bxa0S3aQSK9ZRMZHozG1PJx2rGfwBh7DySr+ASt3w6JmA==;EndpointSuffix=core.windows.net,
+        connection_string="DefaultEndpointsProtocol=https;AccountName=resnettrainingdata;AccountKey=afq0lgt0sj3lq1+b3Y6eeIg+JArkqE5UJL7tHSeM+Bxa0S3aQSK9ZRMZHozG1PJx2rGfwBh7DySr+ASt3w6JmA==;EndpointSuffix=core.windows.net",
         container_name=AZURE_CONTAINER_NAME,
         target_dir=PERSISTENT_PATCH_DIR,
         patch_size=PATCH_SIZE
