@@ -4,7 +4,7 @@ from torch.utils.data import DataLoader, Dataset
 from torchvision.models import resnet50
 from lightly.loss import NegativeCosineSimilarity
 from lightly.models import BYOL
-from lightly.data.collate import BYOLCollateFunction # Correct import for modern lightly
+from lightly.transforms import BYOLTransform  # Use the transform instead of collate function
 from tqdm import tqdm
 import os
 from PIL import Image
@@ -89,8 +89,9 @@ def preprocess_and_save_locally(connection_string, source_container, local_targe
         raise
 
 class PatchedImageDataset(Dataset):
-    def __init__(self, root_dir):
+    def __init__(self, root_dir, transform=None):
         self.root_dir = root_dir
+        self.transform = transform
         self.image_paths = [os.path.join(root_dir, fname) for fname in os.listdir(root_dir)]
 
     def __len__(self):
@@ -99,7 +100,12 @@ class PatchedImageDataset(Dataset):
     def __getitem__(self, idx):
         image_path = self.image_paths[idx]
         patch = Image.open(image_path).convert('RGB')
-        return patch, 0, os.path.basename(image_path)
+        
+        if self.transform:
+            # BYOL expects two augmented views of the same image
+            patch = self.transform(patch)
+            
+        return patch, 0  # Return augmented image and dummy label
 
 def main():
     SOURCE_DATA_CONTAINER = "data"
@@ -115,10 +121,7 @@ def main():
     DATALOADER_WORKERS = 4 if torch.cuda.is_available() else 0
     LR = 1e-3
 
-    connection_string = os.environ.get('AZURE_STORAGE_CONNECTION_STRING')
-    if not connection_string:
-        print("FATAL: Environment variable 'AZURE_STORAGE_CONNECTION_STRING' not set.")
-        return
+    connection_string = "DefaultEndpointsProtocol=https;AccountName=resnettrainingdata;AccountKey=afq0lgt0sj3lq1+b3Y6eeIg+JArkqE5UJL7tHSeM+Bxa0S3aQSK9ZRMZHozG1PJx2rGfwBh7DySr+ASt3w6JmA==;EndpointSuffix=core.windows.net"
 
     print(f"Using device: {DEVICE}")
     
@@ -130,7 +133,29 @@ def main():
     )
 
     try:
-        dataset = PatchedImageDataset(root_dir=LOCAL_PATCH_CACHE_DIR)
+        # Create BYOL transform
+        transform = BYOLTransform(
+            view_1_transform=T.Compose([
+                T.RandomResizedCrop(size=PATCH_SIZE),
+                T.RandomHorizontalFlip(p=0.5),
+                T.RandomApply([T.ColorJitter(0.4, 0.4, 0.4, 0.1)], p=0.8),
+                T.RandomGrayscale(p=0.2),
+                T.GaussianBlur(kernel_size=23),
+                T.ToTensor(),
+                T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+            ]),
+            view_2_transform=T.Compose([
+                T.RandomResizedCrop(size=PATCH_SIZE),
+                T.RandomHorizontalFlip(p=0.5),
+                T.RandomApply([T.ColorJitter(0.4, 0.4, 0.4, 0.1)], p=0.8),
+                T.RandomGrayscale(p=0.2),
+                T.GaussianBlur(kernel_size=23),
+                T.ToTensor(),
+                T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+            ])
+        )
+        
+        dataset = PatchedImageDataset(root_dir=LOCAL_PATCH_CACHE_DIR, transform=transform)
         if len(dataset) == 0:
             print(f"Error: No patches found in local cache '{LOCAL_PATCH_CACHE_DIR}'.")
             return
@@ -138,9 +163,15 @@ def main():
         print(f"Error: The local cache directory '{LOCAL_PATCH_CACHE_DIR}' was not found.")
         return
 
-    # Use the BYOLCollateFunction for modern lightly API
-    collate_fn = BYOLCollateFunction(input_size=PATCH_SIZE)
-    dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, collate_fn=collate_fn, shuffle=True, num_workers=DATALOADER_WORKERS, drop_last=True)
+    # Standard DataLoader without special collate function
+    dataloader = DataLoader(
+        dataset, 
+        batch_size=BATCH_SIZE, 
+        shuffle=True, 
+        num_workers=DATALOADER_WORKERS, 
+        drop_last=True,
+        pin_memory=True if DEVICE == 'cuda' else False
+    )
     
     resnet = resnet50(weights=None)
     resnet.fc = torch.nn.Identity()
@@ -151,11 +182,15 @@ def main():
     print(f"Starting training on {len(dataset)} image patches for {NUM_EPOCHS} epochs...")
     for epoch in range(NUM_EPOCHS):
         total_loss = 0.0
-        for (x0, x1), _, _ in tqdm(dataloader, desc=f"Epoch {epoch+1}/{NUM_EPOCHS}"):
+        for batch in tqdm(dataloader, desc=f"Epoch {epoch+1}/{NUM_EPOCHS}"):
+            # BYOL transform returns ((view1, view2), labels)
+            (x0, x1), _ = batch
             x0, x1 = x0.to(DEVICE), x1.to(DEVICE)
+            
             p0, p1 = model(x0, x1)
             loss = loss_fn(p0, p1)
             total_loss += loss.item()
+            
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
@@ -172,6 +207,6 @@ def main():
     print(f"✅ Training complete. Backbone saved to persistent storage at: {save_path}")
 
 if __name__ == '__main__':
-    # This is important for multiprocessing to work correctly on all platforms
-    multiprocessing.set_start_method('fork')
+    # Use 'spawn' for better compatibility across platforms
+    multiprocessing.set_start_method('spawn', force=True)
     main()
