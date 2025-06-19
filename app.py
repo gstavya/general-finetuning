@@ -100,8 +100,8 @@ def main():
     LOCAL_PATCH_CACHE_DIR = '/mnt/data'
     LOCAL_MODEL_OUTPUT_DIR = '/mnt/satellite-resnet'
     PATCH_SIZE = 224
-    BATCH_SIZE = 512
-    NUM_EPOCHS = 1
+    BATCH_SIZE = 256
+    NUM_EPOCHS = 100
     DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
     DATALOADER_WORKERS = 4 if torch.cuda.is_available() else 0
     LR = 1e-3
