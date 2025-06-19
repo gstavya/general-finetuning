@@ -1,24 +1,20 @@
 import torch
+import torch.nn as nn
 import torchvision.transforms as T
 from torch.utils.data import DataLoader, Dataset
 from torchvision.models import resnet50
-from lightly.loss import NegativeCosineSimilarity
-from lightly.models import BYOL
-from lightly.transforms import BYOLTransform  # Use the transform instead of collate function
 from tqdm import tqdm
 import os
 from PIL import Image
 import io
 import argparse
 from azure.storage.blob import BlobServiceClient
-import multiprocessing # NEW: Import for parallel processing
+import multiprocessing
 
 # Allow loading of large images that might otherwise raise an error
 Image.MAX_IMAGE_PIXELS = None
 
-# --- NEW: Worker function for parallel processing ---
-# This function contains the logic to process a SINGLE blob. It will be
-# executed by each worker in the multiprocessing pool.
+# --- Worker function for parallel processing ---
 def process_blob(args):
     """
     Worker function: downloads, splits, and saves patches for a single image blob.
@@ -51,7 +47,7 @@ def process_blob(args):
     except Exception as e:
         return f"Failed to process {blob_name}: {e}"
 
-# --- MODIFIED: The preprocessing function now orchestrates the parallel work ---
+# --- The preprocessing function orchestrates the parallel work ---
 def preprocess_and_save_locally(connection_string, source_container, local_target_dir, patch_size=224):
     """
     Orchestrates the parallel preprocessing of images from Azure.
@@ -75,11 +71,10 @@ def preprocess_and_save_locally(connection_string, source_container, local_targe
         # Prepare arguments for each worker process
         tasks = [(blob_name, connection_string, source_container, local_target_dir, patch_size) for blob_name in image_blobs]
 
-        # Create a pool of worker processes. os.cpu_count() uses all available cores.
+        # Create a pool of worker processes
         with multiprocessing.Pool(processes=os.cpu_count()) as pool:
             # Use tqdm to show a progress bar for the parallel tasks
             for result in tqdm(pool.imap_unordered(process_blob, tasks), total=len(tasks), desc="Processing Images in Parallel"):
-                # You can optionally print results or errors from workers here
                 pass
         
         print(f"✅ Parallel preprocessing complete. All patches saved to '{local_target_dir}'.")
@@ -102,10 +97,51 @@ class PatchedImageDataset(Dataset):
         patch = Image.open(image_path).convert('RGB')
         
         if self.transform:
-            # BYOL expects two augmented views of the same image
-            patch = self.transform(patch)
+            # Apply the same transform twice to get two different augmented views
+            patch1 = self.transform(patch)
+            patch2 = self.transform(patch)
+            return patch1, patch2
             
-        return patch, 0  # Return augmented image and dummy label
+        return patch, patch
+
+# Simple SimCLR-style contrastive loss
+class ContrastiveLoss(nn.Module):
+    def __init__(self, temperature=0.5):
+        super().__init__()
+        self.temperature = temperature
+        self.criterion = nn.CrossEntropyLoss()
+
+    def forward(self, features1, features2):
+        batch_size = features1.shape[0]
+        
+        # Normalize features
+        features1 = nn.functional.normalize(features1, dim=1)
+        features2 = nn.functional.normalize(features2, dim=1)
+        
+        # Concatenate features
+        features = torch.cat([features1, features2], dim=0)
+        
+        # Compute similarity matrix
+        similarity_matrix = torch.matmul(features, features.T)
+        
+        # Create mask for positive pairs
+        mask = torch.eye(2 * batch_size, dtype=torch.bool, device=features.device)
+        mask = mask.float()
+        
+        # Create labels for contrastive loss
+        labels = torch.cat([torch.arange(batch_size) + batch_size, torch.arange(batch_size)], dim=0)
+        labels = labels.to(features.device)
+        
+        # Compute logits
+        similarity_matrix = similarity_matrix / self.temperature
+        
+        # Mask out self-similarity
+        similarity_matrix.masked_fill_(torch.eye(2 * batch_size, dtype=torch.bool, device=features.device), -9e15)
+        
+        # Compute loss
+        loss = self.criterion(similarity_matrix, labels)
+        
+        return loss
 
 def main():
     SOURCE_DATA_CONTAINER = "data"
@@ -116,8 +152,6 @@ def main():
     BATCH_SIZE = 64
     NUM_EPOCHS = 10
     DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
-    # Recommended to set num_workers in DataLoader to 0 when using multiprocessing
-    # heavily in the main script to avoid contention.
     DATALOADER_WORKERS = 4 if torch.cuda.is_available() else 0
     LR = 1e-3
 
@@ -133,27 +167,16 @@ def main():
     )
 
     try:
-        # Create BYOL transform
-        transform = BYOLTransform(
-            view_1_transform=T.Compose([
-                T.RandomResizedCrop(size=PATCH_SIZE),
-                T.RandomHorizontalFlip(p=0.5),
-                T.RandomApply([T.ColorJitter(0.4, 0.4, 0.4, 0.1)], p=0.8),
-                T.RandomGrayscale(p=0.2),
-                T.GaussianBlur(kernel_size=23),
-                T.ToTensor(),
-                T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-            ]),
-            view_2_transform=T.Compose([
-                T.RandomResizedCrop(size=PATCH_SIZE),
-                T.RandomHorizontalFlip(p=0.5),
-                T.RandomApply([T.ColorJitter(0.4, 0.4, 0.4, 0.1)], p=0.8),
-                T.RandomGrayscale(p=0.2),
-                T.GaussianBlur(kernel_size=23),
-                T.ToTensor(),
-                T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-            ])
-        )
+        # Create augmentation pipeline
+        transform = T.Compose([
+            T.RandomResizedCrop(size=PATCH_SIZE, scale=(0.8, 1.0)),
+            T.RandomHorizontalFlip(p=0.5),
+            T.RandomApply([T.ColorJitter(0.4, 0.4, 0.4, 0.1)], p=0.8),
+            T.RandomGrayscale(p=0.2),
+            T.GaussianBlur(kernel_size=23),
+            T.ToTensor(),
+            T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        ])
         
         dataset = PatchedImageDataset(root_dir=LOCAL_PATCH_CACHE_DIR, transform=transform)
         if len(dataset) == 0:
@@ -163,7 +186,7 @@ def main():
         print(f"Error: The local cache directory '{LOCAL_PATCH_CACHE_DIR}' was not found.")
         return
 
-    # Standard DataLoader without special collate function
+    # Standard DataLoader
     dataloader = DataLoader(
         dataset, 
         batch_size=BATCH_SIZE, 
@@ -173,62 +196,59 @@ def main():
         pin_memory=True if DEVICE == 'cuda' else False
     )
     
-    resnet = resnet50(weights=None)
-    resnet.fc = torch.nn.Identity()
+    # Create model: ResNet50 backbone + projection head
+    backbone = resnet50(weights=None)
+    num_features = backbone.fc.in_features
+    backbone.fc = nn.Identity()
     
-    # Create BYOL model with default configuration
-    model = BYOL(backbone=resnet).to(DEVICE)
+    # Simple projection head
+    projection_head = nn.Sequential(
+        nn.Linear(num_features, 512),
+        nn.ReLU(),
+        nn.Linear(512, 256)
+    )
     
-    optimizer = torch.optim.Adam(model.parameters(), lr=LR)
-    loss_fn = NegativeCosineSimilarity()
+    backbone = backbone.to(DEVICE)
+    projection_head = projection_head.to(DEVICE)
+    
+    # Combine parameters for optimizer
+    params = list(backbone.parameters()) + list(projection_head.parameters())
+    optimizer = torch.optim.Adam(params, lr=LR)
+    
+    loss_fn = ContrastiveLoss(temperature=0.5)
 
     print(f"Starting training on {len(dataset)} image patches for {NUM_EPOCHS} epochs...")
     for epoch in range(NUM_EPOCHS):
         total_loss = 0.0
-        model.train()
+        backbone.train()
+        projection_head.train()
         
-        for batch in tqdm(dataloader, desc=f"Epoch {epoch+1}/{NUM_EPOCHS}"):
-            # BYOL transform returns ((view1, view2), labels)
-            (x0, x1), _ = batch
-            x0, x1 = x0.to(DEVICE), x1.to(DEVICE)
+        for view1, view2 in tqdm(dataloader, desc=f"Epoch {epoch+1}/{NUM_EPOCHS}"):
+            view1, view2 = view1.to(DEVICE), view2.to(DEVICE)
             
-            # Forward pass through BYOL
-            # The model returns predictions in a specific format
-            # Let's inspect what it returns first
-            outputs = model(x0, x1)
+            # Forward pass through backbone and projection head
+            features1 = backbone(view1)
+            features2 = backbone(view2)
             
-            # BYOL typically returns 4 values: p0, z0, p1, z1
-            # But the exact format depends on the lightly version
-            if isinstance(outputs, tuple) and len(outputs) == 4:
-                p0, z0, p1, z1 = outputs
-                # BYOL loss is asymmetric
-                loss = 0.5 * (loss_fn(p0, z1.detach()) + loss_fn(p1, z0.detach()))
-            elif isinstance(outputs, tuple) and len(outputs) == 2:
-                # Some versions might return just (p0, p1)
-                p0, p1 = outputs
-                loss = loss_fn(p0, p1)
-            else:
-                # For debugging - print what we actually get
-                print(f"Unexpected output format: {type(outputs)}, length: {len(outputs) if hasattr(outputs, '__len__') else 'N/A'}")
-                # Try direct loss computation
-                loss = loss_fn(outputs[0], outputs[1])
+            z1 = projection_head(features1)
+            z2 = projection_head(features2)
             
+            # Compute loss
+            loss = loss_fn(z1, z2)
             total_loss += loss.item()
             
+            # Backward pass
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
-            
-            # Update target network with exponential moving average
-            model.update_moving_average()
 
         avg_loss = total_loss / len(dataloader)
         print(f"Epoch {epoch+1} - Average Loss: {avg_loss:.4f}")
 
     print(f"Saving final model to local directory: {LOCAL_MODEL_OUTPUT_DIR}")
     os.makedirs(LOCAL_MODEL_OUTPUT_DIR, exist_ok=True)
-    save_path = os.path.join(LOCAL_MODEL_OUTPUT_DIR, "byol_resnet50_backbone.pth")
-    torch.save(model.backbone.state_dict(), save_path)
+    save_path = os.path.join(LOCAL_MODEL_OUTPUT_DIR, "resnet50_backbone.pth")
+    torch.save(backbone.state_dict(), save_path)
     
     print(f"✅ Training complete. Backbone saved to persistent storage at: {save_path}")
 
