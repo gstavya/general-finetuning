@@ -175,25 +175,42 @@ def main():
     
     resnet = resnet50(weights=None)
     resnet.fc = torch.nn.Identity()
-    model = BYOL(backbone=resnet).to(DEVICE)
+    
+    # Create BYOL model with explicit configuration
+    model = BYOL(
+        backbone=resnet,
+        num_features=2048,  # ResNet50 outputs 2048 features
+        proj_hidden_dim=4096,
+        pred_hidden_dim=256,
+    ).to(DEVICE)
+    
     optimizer = torch.optim.Adam(model.parameters(), lr=LR)
     loss_fn = NegativeCosineSimilarity()
 
     print(f"Starting training on {len(dataset)} image patches for {NUM_EPOCHS} epochs...")
     for epoch in range(NUM_EPOCHS):
         total_loss = 0.0
+        model.train()
+        
         for batch in tqdm(dataloader, desc=f"Epoch {epoch+1}/{NUM_EPOCHS}"):
             # BYOL transform returns ((view1, view2), labels)
             (x0, x1), _ = batch
             x0, x1 = x0.to(DEVICE), x1.to(DEVICE)
             
-            p0, p1 = model(x0, x1)
-            loss = loss_fn(p0, p1)
+            # Forward pass through BYOL
+            # BYOL forward method expects two views and returns predictions
+            p0, z0, p1, z1 = model(x0, x1)
+            
+            # BYOL loss is asymmetric - we only compute loss on the online network predictions
+            # against the target network projections
+            loss = 0.5 * (loss_fn(p0, z1.detach()) + loss_fn(p1, z0.detach()))
             total_loss += loss.item()
             
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
+            
+            # Update target network with exponential moving average
             model.update_moving_average()
 
         avg_loss = total_loss / len(dataloader)
