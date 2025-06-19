@@ -176,13 +176,8 @@ def main():
     resnet = resnet50(weights=None)
     resnet.fc = torch.nn.Identity()
     
-    # Create BYOL model with explicit configuration
-    model = BYOL(
-        backbone=resnet,
-        num_features=2048,  # ResNet50 outputs 2048 features
-        proj_hidden_dim=4096,
-        pred_hidden_dim=256,
-    ).to(DEVICE)
+    # Create BYOL model with default configuration
+    model = BYOL(backbone=resnet).to(DEVICE)
     
     optimizer = torch.optim.Adam(model.parameters(), lr=LR)
     loss_fn = NegativeCosineSimilarity()
@@ -198,12 +193,26 @@ def main():
             x0, x1 = x0.to(DEVICE), x1.to(DEVICE)
             
             # Forward pass through BYOL
-            # BYOL forward method expects two views and returns predictions
-            p0, z0, p1, z1 = model(x0, x1)
+            # The model returns predictions in a specific format
+            # Let's inspect what it returns first
+            outputs = model(x0, x1)
             
-            # BYOL loss is asymmetric - we only compute loss on the online network predictions
-            # against the target network projections
-            loss = 0.5 * (loss_fn(p0, z1.detach()) + loss_fn(p1, z0.detach()))
+            # BYOL typically returns 4 values: p0, z0, p1, z1
+            # But the exact format depends on the lightly version
+            if isinstance(outputs, tuple) and len(outputs) == 4:
+                p0, z0, p1, z1 = outputs
+                # BYOL loss is asymmetric
+                loss = 0.5 * (loss_fn(p0, z1.detach()) + loss_fn(p1, z0.detach()))
+            elif isinstance(outputs, tuple) and len(outputs) == 2:
+                # Some versions might return just (p0, p1)
+                p0, p1 = outputs
+                loss = loss_fn(p0, p1)
+            else:
+                # For debugging - print what we actually get
+                print(f"Unexpected output format: {type(outputs)}, length: {len(outputs) if hasattr(outputs, '__len__') else 'N/A'}")
+                # Try direct loss computation
+                loss = loss_fn(outputs[0], outputs[1])
+            
             total_loss += loss.item()
             
             optimizer.zero_grad()
