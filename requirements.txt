@@ -4,3 +4,4 @@ lightly
 tqdm
 Pillow
 azure-storage-blob
+numpy
