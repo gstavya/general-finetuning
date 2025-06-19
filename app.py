@@ -1,23 +1,23 @@
 import torch
 import torch.nn as nn
 import torchvision.transforms as T
-import torchvision.transforms.v2 as T_v2 # NEW: For modern transforms
+import torchvision.transforms.v2 as T_v2
 from torch.utils.data import DataLoader, Dataset
 from torchvision.models import resnet50
 from lightly.loss import NegativeCosineSimilarity
-from lightly.models import BYOL
-from lightly.transforms import BYOLTransform
+from lightly.models.modules import BYOLPredictionHead, BYOLProjectionHead
 from tqdm import tqdm
 import os
 from PIL import Image
 import io
 from azure.storage.blob import BlobServiceClient
 import multiprocessing
+import copy
 
 # Allow loading of large images that might otherwise raise an error
 Image.MAX_IMAGE_PIXELS = None
 
-# --- Worker function for parallel preprocessing (No changes needed here) ---
+# --- Worker function for parallel preprocessing (No changes needed) ---
 def process_blob(args):
     """
     Worker function: downloads, splits, and saves patches for a single image blob.
@@ -44,11 +44,8 @@ def process_blob(args):
     except Exception as e:
         return f"Failed to process {blob_name}: {e}"
 
-# --- Preprocessing orchestrator (No changes needed here) ---
+# --- Preprocessing orchestrator (No changes needed) ---
 def preprocess_and_save_locally(connection_string, source_container, local_target_dir, patch_size=224):
-    """
-    Orchestrates the parallel preprocessing of images from Azure.
-    """
     if os.path.exists(local_target_dir) and len(os.listdir(local_target_dir)) > 0:
         print(f"Patches already exist in local cache ('{local_target_dir}'). Skipping preprocessing.")
         return
@@ -70,7 +67,7 @@ def preprocess_and_save_locally(connection_string, source_container, local_targe
         print(f"FATAL: An error occurred during preprocessing orchestration: {e}")
         raise
 
-# --- Dataset to apply the transform (No changes needed here) ---
+# --- Custom Dataset (No changes needed) ---
 class PatchedImageDataset(Dataset):
     def __init__(self, root_dir, transform=None):
         self.root_dir = root_dir
@@ -88,6 +85,16 @@ class PatchedImageDataset(Dataset):
             return (view1, view2), 0
         return patch, 0
 
+# --- THE FIX: Manual Exponential Moving Average (EMA) update function ---
+def update_moving_average(ema_model, model, decay):
+    """
+    Updates the weights of the ema_model (target) to be a moving average
+    of the model's (online) weights.
+    """
+    with torch.no_grad():
+        for target_param, online_param in zip(ema_model.parameters(), model.parameters()):
+            target_param.data = decay * target_param.data + (1 - decay) * online_param.data
+
 def main():
     SOURCE_DATA_CONTAINER = "data"
     LOCAL_PATCH_CACHE_DIR = '/mnt/data'
@@ -98,10 +105,10 @@ def main():
     DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
     DATALOADER_WORKERS = 4 if torch.cuda.is_available() else 0
     LR = 1e-3
+    EMA_DECAY = 0.999 # Standard decay rate for BYOL
 
     # --- Securely get connection string from environment variable ---
     connection_string = "DefaultEndpointsProtocol=https;AccountName=resnettrainingdata;AccountKey=afq0lgt0sj3lq1+b3Y6eeIg+JArkqE5UJL7tHSeM+Bxa0S3aQSK9ZRMZHozG1PJx2rGfwBh7DySr+ASt3w6JmA==;EndpointSuffix=core.windows.net"
-
 
     print(f"Using device: {DEVICE}")
     preprocess_and_save_locally(
@@ -111,38 +118,31 @@ def main():
         patch_size=PATCH_SIZE
     )
 
-    try:
-        # --- FIX: Using modern v2 transforms to resolve deprecation warnings ---
-        v2_transforms = T_v2.Compose([
-            T_v2.ToImage(),
-            T_v2.ToDtype(torch.float32, scale=True)
-        ])
-        
-        transform = BYOLTransform(
-            view_1_transform=T.Compose([
-                T.RandomResizedCrop(size=PATCH_SIZE),
+    # --- Using modern v2 transforms ---
+    v2_transforms = T_v2.Compose([
+        T_v2.ToImage(),
+        T_v2.ToDtype(torch.float32, scale=True)
+    ])
+    
+    # Custom transform class to apply augmentations
+    class BYOLTransform:
+        def __init__(self, size):
+            self.transform = T.Compose([
+                T.RandomResizedCrop(size=size),
                 T.RandomHorizontalFlip(p=0.5),
                 T.RandomApply([T.ColorJitter(0.4, 0.4, 0.4, 0.1)], p=0.8),
                 T.RandomGrayscale(p=0.2),
-                v2_transforms, # Use modern tensor conversion
-                T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-            ]),
-            view_2_transform=T.Compose([
-                T.RandomResizedCrop(size=PATCH_SIZE),
-                T.RandomHorizontalFlip(p=0.5),
-                T.RandomApply([T.ColorJitter(0.4, 0.4, 0.4, 0.1)], p=0.8),
-                T.RandomGrayscale(p=0.2),
-                v2_transforms, # Use modern tensor conversion
+                v2_transforms,
                 T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
             ])
-        )
+        def __call__(self, image):
+            return self.transform(image), self.transform(image)
+            
+    transform = BYOLTransform(size=PATCH_SIZE)
 
-        dataset = PatchedImageDataset(root_dir=LOCAL_PATCH_CACHE_DIR, transform=transform)
-        if len(dataset) == 0:
-            print(f"Error: No patches found in local cache '{LOCAL_PATCH_CACHE_DIR}'.")
-            return
-    except FileNotFoundError:
-        print(f"Error: The local cache directory '{LOCAL_PATCH_CACHE_DIR}' was not found.")
+    dataset = PatchedImageDataset(root_dir=LOCAL_PATCH_CACHE_DIR, transform=transform)
+    if len(dataset) == 0:
+        print(f"Error: No patches found in local cache '{LOCAL_PATCH_CACHE_DIR}'.")
         return
 
     dataloader = DataLoader(
@@ -150,45 +150,74 @@ def main():
         num_workers=DATALOADER_WORKERS, drop_last=True
     )
 
-    resnet = resnet50(weights=None)
-    resnet.fc = nn.Identity()
-    model = BYOL(backbone=resnet).to(DEVICE)
-    optimizer = torch.optim.Adam(model.parameters(), lr=LR)
+    # --- THE FIX: Use low-level building blocks instead of deprecated BYOL class ---
+    backbone = resnet50(weights=None)
+    backbone.fc = nn.Identity() # Remove final classification layer
+    
+    # Define the online network
+    online_network = nn.Sequential(
+        copy.deepcopy(backbone), # Use a copy of the backbone
+        BYOLProjectionHead(2048, 4096, 256), # input, hidden, output
+    ).to(DEVICE)
+
+    # Define the target network (a copy of the online network)
+    target_network = copy.deepcopy(online_network).to(DEVICE)
+    
+    # Define the prediction head
+    prediction_head = BYOLPredictionHead(256, 4096, 256).to(DEVICE)
+    
+    # The optimizer only updates the online network and prediction head
+    optimizer = torch.optim.Adam(
+        list(online_network.parameters()) + list(prediction_head.parameters()), 
+        lr=LR
+    )
     loss_fn = NegativeCosineSimilarity()
 
     print(f"Starting training on {len(dataset)} image patches for {NUM_EPOCHS} epochs...")
     for epoch in range(NUM_EPOCHS):
         total_loss = 0.0
-        model.train()
+        online_network.train()
+        prediction_head.train()
+        
         for (view1, view2), _ in tqdm(dataloader, desc=f"Epoch {epoch+1}/{NUM_EPOCHS}"):
             view1, view2 = view1.to(DEVICE), view2.to(DEVICE)
 
-            # --- THE FIX for the TypeError ---
-            # The BYOL model returns predictions and projections. Unpack them correctly.
-            predictions, projections = model(view1, view2)
-            p0, p1 = predictions
-            z0, z1 = projections
+            # --- THE FIX: Correct forward pass and loss calculation ---
+            # Get projections from the online and target networks
+            z0_online = online_network(view1)
+            z1_online = online_network(view2)
+            
+            with torch.no_grad():
+                z0_target = target_network(view1)
+                z1_target = target_network(view2)
+
+            # Get predictions from the online network's projections
+            p0 = prediction_head(z0_online)
+            p1 = prediction_head(z1_online)
 
             # Use the asymmetric BYOL loss
-            loss = 0.5 * (loss_fn(p0, z1.detach()) + loss_fn(p1, z0.detach()))
+            loss = 0.5 * (loss_fn(p0, z1_target.detach()) + loss_fn(p1, z0_target.detach()))
             total_loss += loss.item()
 
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
-            model.update_moving_average()
+
+            # --- THE FIX: Manually update the moving average of the target network ---
+            update_moving_average(target_network, online_network, decay=EMA_DECAY)
 
         avg_loss = total_loss / len(dataloader)
         print(f"Epoch {epoch+1} - Average Loss: {avg_loss:.4f}")
 
-    print(f"Saving final model to local directory: {LOCAL_MODEL_OUTPUT_DIR}")
+    print(f"Saving final model backbone to local directory: {LOCAL_MODEL_OUTPUT_DIR}")
     os.makedirs(LOCAL_MODEL_OUTPUT_DIR, exist_ok=True)
     save_path = os.path.join(LOCAL_MODEL_OUTPUT_DIR, "resnet50_backbone.pth")
-    torch.save(model.backbone.state_dict(), save_path)
+    # Save the backbone from the online network
+    # The backbone is the first element of the online_network sequential model
+    torch.save(online_network[0].state_dict(), save_path)
     print(f"✅ Training complete. Backbone saved to persistent storage at: {save_path}")
 
 if __name__ == '__main__':
-    # Using 'fork' is generally faster on Linux if available. 'spawn' is a safe fallback.
     if multiprocessing.get_start_method(allow_none=True) != 'fork':
         multiprocessing.set_start_method('fork', force=True)
     main()
