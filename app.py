@@ -85,7 +85,7 @@ class PatchedImageDataset(Dataset):
             return (view1, view2), 0
         return patch, 0
 
-# --- THE FIX: Manual Exponential Moving Average (EMA) update function ---
+# --- Manual Exponential Moving Average (EMA) update function (No changes needed) ---
 def update_moving_average(ema_model, model, decay):
     """
     Updates the weights of the ema_model (target) to be a moving average
@@ -96,7 +96,13 @@ def update_moving_average(ema_model, model, decay):
             target_param.data = decay * target_param.data + (1 - decay) * online_param.data
 
 def main():
+    # --- Configuration ---
     SOURCE_DATA_CONTAINER = "data"
+    # *** MODIFICATION: Added Azure container and blob name for the model file ***
+    MODEL_CONTAINER = "resnet50"
+    BACKBONE_BLOB_NAME = "resnet50_backbone.pth" # The name of your .pth file in the container
+    USE_CUSTOM_BACKBONE = True # Set to True to load from Azure
+
     LOCAL_PATCH_CACHE_DIR = '/mnt/data'
     LOCAL_MODEL_OUTPUT_DIR = '/mnt/satellite-resnet'
     PATCH_SIZE = 224
@@ -107,8 +113,9 @@ def main():
     LR = 1e-3
     EMA_DECAY = 0.999 # Standard decay rate for BYOL
 
-    # --- Securely get connection string from environment variable ---
     connection_string = "DefaultEndpointsProtocol=https;AccountName=resnettrainingdata;AccountKey=afq0lgt0sj3lq1+b3Y6eeIg+JArkqE5UJL7tHSeM+Bxa0S3aQSK9ZRMZHozG1PJx2rGfwBh7DySr+ASt3w6JmA==;EndpointSuffix=core.windows.net"
+    if not connection_string:
+        raise ValueError("Azure Storage connection string is not set.")
 
     print(f"Using device: {DEVICE}")
     preprocess_and_save_locally(
@@ -118,13 +125,12 @@ def main():
         patch_size=PATCH_SIZE
     )
 
-    # --- Using modern v2 transforms ---
+    # --- Data Transforms ---
     v2_transforms = T_v2.Compose([
         T_v2.ToImage(),
         T_v2.ToDtype(torch.float32, scale=True)
     ])
     
-    # Custom transform class to apply augmentations
     class BYOLTransform:
         def __init__(self, size):
             self.transform = T.Compose([
@@ -142,7 +148,7 @@ def main():
 
     dataset = PatchedImageDataset(root_dir=LOCAL_PATCH_CACHE_DIR, transform=transform)
     if len(dataset) == 0:
-        print(f"Error: No patches found in local cache '{LOCAL_PATCH_CACHE_DIR}'.")
+        print(f"Error: No patches found in local cache '{LOCAL_PATCH_CACHE_DIR}'. Aborting.")
         return
 
     dataloader = DataLoader(
@@ -150,29 +156,55 @@ def main():
         num_workers=DATALOADER_WORKERS, drop_last=True
     )
 
-    # --- THE FIX: Use low-level building blocks instead of deprecated BYOL class ---
-    backbone = resnet50(weights=None)
-    backbone.fc = nn.Identity() # Remove final classification layer
-    
-    # Define the online network
+    # --- Model Initialization ---
+    # *** MODIFICATION: Corrected to always use resnet50 and removed FPN/other complexities ***
+    backbone = resnet50(weights=None) # Start with randomly initialized weights
+    backbone.fc = nn.Identity() # Remove final classification layer for feature extraction
+
+    # *** MODIFICATION: Load custom backbone from Azure Blob Storage ***
+    if USE_CUSTOM_BACKBONE:
+        print(f"Attempting to load custom backbone '{BACKBONE_BLOB_NAME}' from Azure container '{MODEL_CONTAINER}'...")
+        try:
+            # 1. Connect to Azure Blob Storage
+            blob_service_client = BlobServiceClient.from_connection_string(connection_string)
+            blob_client = blob_service_client.get_blob_client(container=MODEL_CONTAINER, blob=BACKBONE_BLOB_NAME)
+
+            # 2. Download the model state dict into an in-memory stream
+            print(f"Downloading blob '{BACKBONE_BLOB_NAME}'...")
+            with io.BytesIO() as stream:
+                blob_client.download_blob().readinto(stream)
+                stream.seek(0) # Rewind stream to the beginning for reading
+
+                # 3. Load the state dict from the stream onto the correct device
+                state_dict = torch.load(stream, map_location=DEVICE)
+                
+                # 4. Load the state into the backbone model
+                backbone.load_state_dict(state_dict)
+                print("✅ Custom backbone loaded successfully from Azure.")
+
+        except Exception as e:
+            # Catch exceptions from Azure (e.g., file not found) or torch.load
+            print(f"⚠️ WARNING: Failed to load custom backbone from Azure. Error: {e}")
+            print("Proceeding with randomly initialized weights.")
+            # No action needed, backbone is already randomly initialized.
+
+    # --- BYOL Network Setup ---
+    # The backbone (either randomly initialized or loaded from Azure) is now used here
     online_network = nn.Sequential(
-        copy.deepcopy(backbone), # Use a copy of the backbone
-        BYOLProjectionHead(2048, 4096, 256), # input, hidden, output
+        backbone, # Use the prepared backbone
+        BYOLProjectionHead(2048, 4096, 256), # input_dim, hidden_dim, output_dim
     ).to(DEVICE)
 
-    # Define the target network (a copy of the online network)
     target_network = copy.deepcopy(online_network).to(DEVICE)
-    
-    # Define the prediction head
     prediction_head = BYOLPredictionHead(256, 4096, 256).to(DEVICE)
     
-    # The optimizer only updates the online network and prediction head
     optimizer = torch.optim.Adam(
         list(online_network.parameters()) + list(prediction_head.parameters()), 
         lr=LR
     )
     loss_fn = NegativeCosineSimilarity()
 
+    # --- Training Loop ---
     print(f"Starting training on {len(dataset)} image patches for {NUM_EPOCHS} epochs...")
     for epoch in range(NUM_EPOCHS):
         total_loss = 0.0
@@ -182,42 +214,45 @@ def main():
         for (view1, view2), _ in tqdm(dataloader, desc=f"Epoch {epoch+1}/{NUM_EPOCHS}"):
             view1, view2 = view1.to(DEVICE), view2.to(DEVICE)
 
-            # --- THE FIX: Correct forward pass and loss calculation ---
-            # Get projections from the online and target networks
+            # Forward pass through online network
             z0_online = online_network(view1)
             z1_online = online_network(view2)
             
+            # Forward pass through target network (no gradients)
             with torch.no_grad():
                 z0_target = target_network(view1)
                 z1_target = target_network(view2)
 
-            # Get predictions from the online network's projections
+            # Predictions
             p0 = prediction_head(z0_online)
             p1 = prediction_head(z1_online)
 
-            # Use the asymmetric BYOL loss
+            # Calculate loss
             loss = 0.5 * (loss_fn(p0, z1_target.detach()) + loss_fn(p1, z0_target.detach()))
             total_loss += loss.item()
 
+            # Backpropagation and optimization
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
 
-            # --- THE FIX: Manually update the moving average of the target network ---
+            # Update target network using exponential moving average
             update_moving_average(target_network, online_network, decay=EMA_DECAY)
 
         avg_loss = total_loss / len(dataloader)
         print(f"Epoch {epoch+1} - Average Loss: {avg_loss:.4f}")
 
+    # --- Save Final Model ---
     print(f"Saving final model backbone to local directory: {LOCAL_MODEL_OUTPUT_DIR}")
     os.makedirs(LOCAL_MODEL_OUTPUT_DIR, exist_ok=True)
-    save_path = os.path.join(LOCAL_MODEL_OUTPUT_DIR, "resnet50_backbone.pth")
-    # Save the backbone from the online network
+    save_path = os.path.join(LOCAL_MODEL_OUTPUT_DIR, "resnet50_backbone_final.pth")
+    
     # The backbone is the first element of the online_network sequential model
     torch.save(online_network[0].state_dict(), save_path)
     print(f"✅ Training complete. Backbone saved to persistent storage at: {save_path}")
 
 if __name__ == '__main__':
+    # Set multiprocessing start method for compatibility if needed
     if multiprocessing.get_start_method(allow_none=True) != 'fork':
         multiprocessing.set_start_method('fork', force=True)
     main()
