@@ -214,12 +214,9 @@ def collate_fn(batch):
 def main():
     """Main function to run the training pipeline with GPU optimizations."""
     # --- AZURE & LOCAL PATH CONFIGURATION ---
-    AZURE_CONNECTION_STRING = os.environ.get("AZURE_STORAGE_CONNECTION_STRING")
-    if not AZURE_CONNECTION_STRING:
-        print("FATAL: Azure connection string is not set. Please set the AZURE_STORAGE_CONNECTION_STRING environment variable.")
-        return
+    AZURE_CONNECTION_STRING = "DefaultEndpointsProtocol=https;AccountName=resnettrainingdata;AccountKey=afq0lgt0sj3lq1+b3Y6eeIg+JArkqE5UJL7tHSeM+Bxa0S3aQSK9ZRMZHozG1PJx2rGfwBh7DySr+ASt3w6JmA==;EndpointSuffix=core.windows.net"
     AZURE_CONTAINER_NAME = 'labeled'
-    AZURE_BLOB_PREFIX = 'roads/'
+    AZURE_BLOB_PREFIX = 'sidewalk/'
     LOCAL_DATA_PATH = '/mnt/data'
     MODEL_SAVE_PATH = '/mnt/satellite-resnet'
     
@@ -242,7 +239,7 @@ def main():
         T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
     ])
 
-    BASE_DIR = os.path.join(LOCAL_DATA_PATH, 'roads')
+    BASE_DIR = os.path.join(LOCAL_DATA_PATH, 'sidewalk')
     train_dataset = CocoPolygonDataset(os.path.join(BASE_DIR, 'train'), os.path.join(BASE_DIR, 'train_annotations.coco.json'), image_transforms, num_vertices=NUM_VERTICES)
     val_dataset = CocoPolygonDataset(os.path.join(BASE_DIR, 'valid'), os.path.join(BASE_DIR, 'valid_annotations.coco.json'), image_transforms, num_vertices=NUM_VERTICES)
 
