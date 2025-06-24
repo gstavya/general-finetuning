@@ -229,7 +229,7 @@ def main():
     print(f"Using device: {device}. Automatic Mixed Precision (AMP): {'Enabled' if use_amp else 'Disabled'}")
 
     NUM_VERTICES = 8
-    BATCH_SIZE = 256  # Increased for GPU
+    BATCH_SIZE = 32  # Increased for GPU
     NUM_EPOCHS = 50
     LEARNING_RATE = 1e-4
     NUM_WORKERS = 4  # Increased for faster data loading
