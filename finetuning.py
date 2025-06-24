@@ -37,7 +37,7 @@ def download_data_from_azure(connection_string, container_name, blob_prefix, loc
         for blob in blob_list:
             # Construct the full local path
             relative_path = os.path.relpath(blob.name, blob_prefix)
-            local_file_path = os.path.join(local_download_path, 'roads', relative_path)
+            local_file_path = os.path.join(local_download_path, 'sidewalk', relative_path)
             local_file_dir = os.path.dirname(local_file_path)
 
             # Create local directory if it doesn't exist
