@@ -3,7 +3,8 @@ import torch.nn as nn
 import torchvision.transforms as T
 import torchvision.transforms.v2 as T_v2
 from torch.utils.data import DataLoader, Dataset
-from torchvision.models import resnet50
+# --- MODIFICATION: Changed resnet50 to resnet18 ---
+from torchvision.models import resnet18, ResNet18_Weights
 from lightly.loss import NegativeCosineSimilarity
 from lightly.models.modules import BYOLPredictionHead, BYOLProjectionHead
 from tqdm import tqdm
@@ -98,16 +99,11 @@ def update_moving_average(ema_model, model, decay):
 def main():
     # --- Configuration ---
     SOURCE_DATA_CONTAINER = "data"
-    # *** MODIFICATION: Added Azure container and blob name for the model file ***
-    MODEL_CONTAINER = "resnet50"
-    BACKBONE_BLOB_NAME = "resnet50_backbone.pth" # The name of your .pth file in the container
-    USE_CUSTOM_BACKBONE = True # Set to True to load from Azure
-
     LOCAL_PATCH_CACHE_DIR = '/mnt/data'
     LOCAL_MODEL_OUTPUT_DIR = '/mnt/satellite-resnet'
     PATCH_SIZE = 224
     BATCH_SIZE = 256
-    NUM_EPOCHS = 20
+    NUM_EPOCHS = 50
     DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
     DATALOADER_WORKERS = 4 if torch.cuda.is_available() else 0
     LR = 1e-3
@@ -155,44 +151,14 @@ def main():
         dataset, batch_size=BATCH_SIZE, shuffle=True,
         num_workers=DATALOADER_WORKERS, drop_last=True
     )
+    print("Initializing default ResNet-18 backbone with pre-trained ImageNet weights...")
+    backbone = resnet18(weights=ResNet18_Weights.DEFAULT)
+    backbone.fc = nn.Identity() 
+    print("✅ ResNet-18 backbone initialized.")
 
-    # --- Model Initialization ---
-    # *** MODIFICATION: Corrected to always use resnet50 and removed FPN/other complexities ***
-    backbone = resnet50(weights=None) # Start with randomly initialized weights
-    backbone.fc = nn.Identity() # Remove final classification layer for feature extraction
-
-    # *** MODIFICATION: Load custom backbone from Azure Blob Storage ***
-    if USE_CUSTOM_BACKBONE:
-        print(f"Attempting to load custom backbone '{BACKBONE_BLOB_NAME}' from Azure container '{MODEL_CONTAINER}'...")
-        try:
-            # 1. Connect to Azure Blob Storage
-            blob_service_client = BlobServiceClient.from_connection_string(connection_string)
-            blob_client = blob_service_client.get_blob_client(container=MODEL_CONTAINER, blob=BACKBONE_BLOB_NAME)
-
-            # 2. Download the model state dict into an in-memory stream
-            print(f"Downloading blob '{BACKBONE_BLOB_NAME}'...")
-            with io.BytesIO() as stream:
-                blob_client.download_blob().readinto(stream)
-                stream.seek(0) # Rewind stream to the beginning for reading
-
-                # 3. Load the state dict from the stream onto the correct device
-                state_dict = torch.load(stream, map_location=DEVICE)
-                
-                # 4. Load the state into the backbone model
-                backbone.load_state_dict(state_dict)
-                print("✅ Custom backbone loaded successfully from Azure.")
-
-        except Exception as e:
-            # Catch exceptions from Azure (e.g., file not found) or torch.load
-            print(f"⚠️ WARNING: Failed to load custom backbone from Azure. Error: {e}")
-            print("Proceeding with randomly initialized weights.")
-            # No action needed, backbone is already randomly initialized.
-
-    # --- BYOL Network Setup ---
-    # The backbone (either randomly initialized or loaded from Azure) is now used here
     online_network = nn.Sequential(
-        backbone, # Use the prepared backbone
-        BYOLProjectionHead(2048, 4096, 256), # input_dim, hidden_dim, output_dim
+        backbone, # Use the prepared resnet18 backbone
+        BYOLProjectionHead(512, 4096, 256), # input_dim, hidden_dim, output_dim
     ).to(DEVICE)
 
     target_network = copy.deepcopy(online_network).to(DEVICE)
@@ -243,9 +209,10 @@ def main():
         print(f"Epoch {epoch+1} - Average Loss: {avg_loss:.4f}")
 
     # --- Save Final Model ---
+    # *** MODIFICATION: Changed save path to reflect resnet18 architecture ***
     print(f"Saving final model backbone to local directory: {LOCAL_MODEL_OUTPUT_DIR}")
     os.makedirs(LOCAL_MODEL_OUTPUT_DIR, exist_ok=True)
-    save_path = os.path.join(LOCAL_MODEL_OUTPUT_DIR, "resnet50_backbone_final.pth")
+    save_path = os.path.join(LOCAL_MODEL_OUTPUT_DIR, "resnet18_backbone_final.pth")
     
     # The backbone is the first element of the online_network sequential model
     torch.save(online_network[0].state_dict(), save_path)
