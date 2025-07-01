@@ -102,7 +102,7 @@ def main():
     SOURCE_DATA_CONTAINER = "data"
     LOCAL_PATCH_CACHE_DIR = '/mnt/data'
     # --- MODIFICATION: Consistent naming for output directory ---
-    LOCAL_MODEL_OUTPUT_DIR = '/mnt/satellite-resnet'
+    LOCAL_MODEL_OUTPUT_DIR = '/mnt/satellite-resnet2'
     PATCH_SIZE = 224
     BATCH_SIZE = 256
     NUM_EPOCHS = 50
