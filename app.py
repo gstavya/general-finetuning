@@ -14,6 +14,7 @@ import io
 from azure.storage.blob import BlobServiceClient
 import multiprocessing
 import copy
+import glob # MODIFICATION: Added for finding checkpoint files
 
 # Allow loading of large images that might otherwise raise an error
 Image.MAX_IMAGE_PIXELS = None
@@ -100,7 +101,8 @@ def main():
     # --- Configuration ---
     SOURCE_DATA_CONTAINER = "data"
     LOCAL_PATCH_CACHE_DIR = '/mnt/data'
-    LOCAL_MODEL_OUTPUT_DIR = '/mnt/satellite-resnet2'
+    # --- MODIFICATION: Consistent naming for output directory ---
+    LOCAL_MODEL_OUTPUT_DIR = '/mnt/satellite-resnet'
     PATCH_SIZE = 224
     BATCH_SIZE = 256
     NUM_EPOCHS = 50
@@ -170,9 +172,31 @@ def main():
     )
     loss_fn = NegativeCosineSimilarity()
 
+    # --- MODIFICATION: Check for and load a checkpoint ---
+    start_epoch = 0
+    os.makedirs(LOCAL_MODEL_OUTPUT_DIR, exist_ok=True)
+    checkpoint_files = sorted(glob.glob(os.path.join(LOCAL_MODEL_OUTPUT_DIR, "checkpoint_epoch_*.pth")))
+
+    if checkpoint_files:
+        latest_checkpoint_path = checkpoint_files[-1]
+        print(f"Resuming training from checkpoint: {latest_checkpoint_path}")
+        checkpoint = torch.load(latest_checkpoint_path, map_location=DEVICE)
+        
+        online_network.load_state_dict(checkpoint['online_network_state_dict'])
+        target_network.load_state_dict(checkpoint['target_network_state_dict'])
+        prediction_head.load_state_dict(checkpoint['prediction_head_state_dict'])
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        start_epoch = checkpoint['epoch'] + 1
+        
+        print(f"✅ Resumed from epoch {start_epoch}.")
+    else:
+        print("No checkpoint found. Starting training from scratch.")
+    # --- END MODIFICATION ---
+
     # --- Training Loop ---
-    print(f"Starting training on {len(dataset)} image patches for {NUM_EPOCHS} epochs...")
-    for epoch in range(NUM_EPOCHS):
+    # --- MODIFICATION: Adjust range to account for start_epoch ---
+    print(f"Starting training on {len(dataset)} image patches from epoch {start_epoch + 1} to {NUM_EPOCHS}...")
+    for epoch in range(start_epoch, NUM_EPOCHS):
         total_loss = 0.0
         online_network.train()
         prediction_head.train()
@@ -207,6 +231,24 @@ def main():
 
         avg_loss = total_loss / len(dataloader)
         print(f"Epoch {epoch+1} - Average Loss: {avg_loss:.4f}")
+        
+        # --- MODIFICATION: Save checkpoint every 5 epochs ---
+        if (epoch + 1) % 5 == 0:
+            checkpoint_path = os.path.join(LOCAL_MODEL_OUTPUT_DIR, f"checkpoint_epoch_{epoch+1}.pth")
+            print(f"Saving checkpoint to {checkpoint_path}...")
+            
+            # The checkpoint includes everything needed to resume
+            torch.save({
+                'epoch': epoch,
+                'online_network_state_dict': online_network.state_dict(),
+                'target_network_state_dict': target_network.state_dict(),
+                'prediction_head_state_dict': prediction_head.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'loss': avg_loss,
+            }, checkpoint_path)
+            print("✅ Checkpoint saved.")
+        # --- END MODIFICATION ---
+
 
     # --- Save Final Model ---
     # *** MODIFICATION: Changed save path to reflect resnet18 architecture ***
