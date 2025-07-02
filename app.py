@@ -45,6 +45,29 @@ def process_blob(args):
     except Exception as e:
         return f"Failed to process {blob_name}: {e}"
 
+def upload_checkpoint_to_azure(connection_string, container_name, local_file_path, blob_name):
+    """Uploads a local file to Azure Blob Storage."""
+    try:
+        blob_service_client = BlobServiceClient.from_connection_string(connection_string)
+        # Ensure the container exists
+        try:
+            container_client = blob_service_client.create_container(container_name)
+            print(f"Container '{container_name}' created.")
+        except Exception:
+            # Container already exists
+            container_client = blob_service_client.get_container_client(container_name)
+            print(f"Container '{container_name}' already exists.")
+
+        blob_client = container_client.get_blob_client(blob_name)
+
+        print(f"Uploading checkpoint to Azure as blob: {blob_name}...")
+        with open(local_file_path, "rb") as data:
+            blob_client.upload_blob(data, overwrite=True)
+        print("✅ Checkpoint successfully uploaded to Azure.")
+
+    except Exception as e:
+        print(f"WARNING: Failed to upload checkpoint to Azure. Error: {e}")
+
 # --- Preprocessing orchestrator (No changes needed) ---
 def preprocess_and_save_locally(connection_string, source_container, local_target_dir, patch_size=224):
     if os.path.exists(local_target_dir) and len(os.listdir(local_target_dir)) > 0:
@@ -263,6 +286,17 @@ def main():
                 'loss': avg_loss,
             }, checkpoint_save_path)
             print("✅ Checkpoint saved.")
+  
+            try:
+                upload_checkpoint_to_azure(
+                    connection_string=connection_string,
+                    container_name="resnet18",
+                    local_file_path=checkpoint_save_path,
+                    blob_name=checkpoint_save_path 
+                )
+            except Exception as e:
+                print(f"Non-fatal: Failed to save checkpoint to Azure. Error: {e}")
+                
 
     # --- Save Final Model ---
     print(f"Saving final model backbone to local directory: {LOCAL_MODEL_OUTPUT_DIR}")
