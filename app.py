@@ -3,18 +3,17 @@ import torch.nn as nn
 import torchvision.transforms as T
 import torchvision.transforms.v2 as T_v2
 from torch.utils.data import DataLoader, Dataset
-# --- MODIFICATION: Changed resnet50 to resnet18 ---
-from torchvision.models import resnet18, ResNet18_Weights
+from torchvision.models import resnet18
 from lightly.loss import NegativeCosineSimilarity
 from lightly.models.modules import BYOLPredictionHead, BYOLProjectionHead
 from tqdm import tqdm
 import os
 from PIL import Image
-import io
+import io # MODIFICATION: Added for in-memory stream
 from azure.storage.blob import BlobServiceClient
 import multiprocessing
 import copy
-import glob # MODIFICATION: Added for finding checkpoint files
+import glob
 
 # Allow loading of large images that might otherwise raise an error
 Image.MAX_IMAGE_PIXELS = None
@@ -101,7 +100,6 @@ def main():
     # --- Configuration ---
     SOURCE_DATA_CONTAINER = "data"
     LOCAL_PATCH_CACHE_DIR = '/mnt/data'
-    # --- MODIFICATION: Consistent naming for output directory ---
     LOCAL_MODEL_OUTPUT_DIR = '/mnt/satellite-resnet2'
     PATCH_SIZE = 224
     BATCH_SIZE = 256
@@ -109,7 +107,7 @@ def main():
     DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
     DATALOADER_WORKERS = 4 if torch.cuda.is_available() else 0
     LR = 1e-3
-    EMA_DECAY = 0.999 # Standard decay rate for BYOL
+    EMA_DECAY = 0.999
 
     connection_string = "DefaultEndpointsProtocol=https;AccountName=resnettrainingdata;AccountKey=afq0lgt0sj3lq1+b3Y6eeIg+JArkqE5UJL7tHSeM+Bxa0S3aQSK9ZRMZHozG1PJx2rGfwBh7DySr+ASt3w6JmA==;EndpointSuffix=core.windows.net"
     if not connection_string:
@@ -128,7 +126,7 @@ def main():
         T_v2.ToImage(),
         T_v2.ToDtype(torch.float32, scale=True)
     ])
-    
+
     class BYOLTransform:
         def __init__(self, size):
             self.transform = T.Compose([
@@ -141,7 +139,7 @@ def main():
             ])
         def __call__(self, image):
             return self.transform(image), self.transform(image)
-            
+
     transform = BYOLTransform(size=PATCH_SIZE)
 
     dataset = PatchedImageDataset(root_dir=LOCAL_PATCH_CACHE_DIR, transform=transform)
@@ -153,91 +151,109 @@ def main():
         dataset, batch_size=BATCH_SIZE, shuffle=True,
         num_workers=DATALOADER_WORKERS, drop_last=True
     )
-    print("Initializing default ResNet-18 backbone with pre-trained ImageNet weights...")
-    backbone = resnet18(weights=ResNet18_Weights.DEFAULT)
-    backbone.fc = nn.Identity() 
-    print("✅ ResNet-18 backbone initialized.")
+
+    # --- Initialize Model Structure ---
+    print("Initializing ResNet-18 model structure...")
+    backbone = resnet18(weights=None)
+    backbone.fc = nn.Identity()
+    print("✅ ResNet-18 structure initialized.")
 
     online_network = nn.Sequential(
-        backbone, # Use the prepared resnet18 backbone
-        BYOLProjectionHead(512, 4096, 256), # input_dim, hidden_dim, output_dim
+        backbone,
+        BYOLProjectionHead(512, 4096, 256),
     ).to(DEVICE)
 
     target_network = copy.deepcopy(online_network).to(DEVICE)
     prediction_head = BYOLPredictionHead(256, 4096, 256).to(DEVICE)
-    
+
     optimizer = torch.optim.Adam(
-        list(online_network.parameters()) + list(prediction_head.parameters()), 
+        list(online_network.parameters()) + list(prediction_head.parameters()),
         lr=LR
     )
     loss_fn = NegativeCosineSimilarity()
 
-    # --- MODIFICATION: Check for and load a checkpoint ---
-    start_epoch = 0
-    os.makedirs(LOCAL_MODEL_OUTPUT_DIR, exist_ok=True)
-    checkpoint_files = sorted(glob.glob(os.path.join(LOCAL_MODEL_OUTPUT_DIR, "checkpoint_epoch_*.pth")))
 
-    if checkpoint_files:
-        latest_checkpoint_path = checkpoint_files[-1]
-        print(f"Resuming training from checkpoint: {latest_checkpoint_path}")
-        checkpoint = torch.load(latest_checkpoint_path, map_location=DEVICE)
-        
+    # --- MODIFICATION: Load a specific checkpoint from Azure Blob Storage ---
+    start_epoch = 0
+    # The local output directory is still needed to save *new* checkpoints during training
+    os.makedirs(LOCAL_MODEL_OUTPUT_DIR, exist_ok=True)
+
+    # Configuration for the checkpoint in Azure
+    CHECKPOINT_CONTAINER = "resnet18"
+    CHECKPOINT_BLOB_NAME = "checkpoint_epoch_20.pth"
+
+    print(f"Attempting to load checkpoint '{CHECKPOINT_BLOB_NAME}' from Azure container '{CHECKPOINT_CONTAINER}'...")
+
+    try:
+        # Create a client to interact with the blob
+        blob_service_client = BlobServiceClient.from_connection_string(connection_string)
+        blob_client = blob_service_client.get_blob_client(container=CHECKPOINT_CONTAINER, blob=CHECKPOINT_BLOB_NAME)
+
+        # Download the checkpoint into an in-memory byte stream
+        downloader = blob_client.download_blob()
+        checkpoint_bytes = downloader.readall()
+        buffer = io.BytesIO(checkpoint_bytes)
+        buffer.seek(0)  # Rewind buffer to the beginning before reading
+
+        # Load the checkpoint directly from the in-memory buffer
+        checkpoint = torch.load(buffer, map_location=DEVICE)
+        print("✅ Checkpoint successfully downloaded and loaded from Azure.")
+
+        # Load all the saved states into the initialized models and optimizer
         online_network.load_state_dict(checkpoint['online_network_state_dict'])
         target_network.load_state_dict(checkpoint['target_network_state_dict'])
         prediction_head.load_state_dict(checkpoint['prediction_head_state_dict'])
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        start_epoch = checkpoint['epoch'] + 1
-        
-        print(f"✅ Resumed from epoch {start_epoch}.")
-    else:
-        print("No checkpoint found. Starting training from scratch.")
+        start_epoch = checkpoint['epoch'] + 1  # Set start epoch for continuing training
+
+        print(f"✅ State loaded. Training will resume from epoch {start_epoch}.")
+
+    except Exception as e:
+        # This will catch errors if the blob doesn't exist, connection fails, etc.
+        print(f"FATAL: Failed to load checkpoint from Azure. Error: {e}")
+        print("Please ensure the checkpoint exists in the specified container and the connection string is correct.")
+        return # Exit the main function
     # --- END MODIFICATION ---
 
+
     # --- Training Loop ---
-    # --- MODIFICATION: Adjust range to account for start_epoch ---
-    print(f"Starting training on {len(dataset)} image patches from epoch {start_epoch + 1} to {NUM_EPOCHS}...")
+    print(f"Starting training on {len(dataset)} image patches from epoch {start_epoch} to {NUM_EPOCHS}...")
     for epoch in range(start_epoch, NUM_EPOCHS):
         total_loss = 0.0
         online_network.train()
         prediction_head.train()
-        
+
         for (view1, view2), _ in tqdm(dataloader, desc=f"Epoch {epoch+1}/{NUM_EPOCHS}"):
             view1, view2 = view1.to(DEVICE), view2.to(DEVICE)
 
-            # Forward pass through online network
+            # Forward pass
             z0_online = online_network(view1)
             z1_online = online_network(view2)
-            
-            # Forward pass through target network (no gradients)
             with torch.no_grad():
                 z0_target = target_network(view1)
                 z1_target = target_network(view2)
-
-            # Predictions
             p0 = prediction_head(z0_online)
             p1 = prediction_head(z1_online)
 
-            # Calculate loss
+            # Loss calculation
             loss = 0.5 * (loss_fn(p0, z1_target.detach()) + loss_fn(p1, z0_target.detach()))
             total_loss += loss.item()
 
-            # Backpropagation and optimization
+            # Backpropagation
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
 
-            # Update target network using exponential moving average
+            # EMA update
             update_moving_average(target_network, online_network, decay=EMA_DECAY)
 
         avg_loss = total_loss / len(dataloader)
         print(f"Epoch {epoch+1} - Average Loss: {avg_loss:.4f}")
-        
-        # --- MODIFICATION: Save checkpoint every 5 epochs ---
+
+        # Save checkpoint to the *local* directory every 5 epochs
         if (epoch + 1) % 5 == 0:
-            checkpoint_path = os.path.join(LOCAL_MODEL_OUTPUT_DIR, f"checkpoint_epoch_{epoch+1}.pth")
-            print(f"Saving checkpoint to {checkpoint_path}...")
-            
-            # The checkpoint includes everything needed to resume
+            checkpoint_save_path = os.path.join(LOCAL_MODEL_OUTPUT_DIR, f"checkpoint_epoch_{epoch+1}.pth")
+            print(f"Saving checkpoint to {checkpoint_save_path}...")
             torch.save({
                 'epoch': epoch,
                 'online_network_state_dict': online_network.state_dict(),
@@ -245,23 +261,16 @@ def main():
                 'prediction_head_state_dict': prediction_head.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'loss': avg_loss,
-            }, checkpoint_path)
+            }, checkpoint_save_path)
             print("✅ Checkpoint saved.")
-        # --- END MODIFICATION ---
-
 
     # --- Save Final Model ---
-    # *** MODIFICATION: Changed save path to reflect resnet18 architecture ***
     print(f"Saving final model backbone to local directory: {LOCAL_MODEL_OUTPUT_DIR}")
-    os.makedirs(LOCAL_MODEL_OUTPUT_DIR, exist_ok=True)
     save_path = os.path.join(LOCAL_MODEL_OUTPUT_DIR, "resnet18_backbone_final.pth")
-    
-    # The backbone is the first element of the online_network sequential model
     torch.save(online_network[0].state_dict(), save_path)
     print(f"✅ Training complete. Backbone saved to persistent storage at: {save_path}")
 
 if __name__ == '__main__':
-    # Set multiprocessing start method for compatibility if needed
     if multiprocessing.get_start_method(allow_none=True) != 'fork':
         multiprocessing.set_start_method('fork', force=True)
     main()
