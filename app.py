@@ -292,7 +292,7 @@ def main():
                     connection_string=connection_string,
                     container_name="resnet18",
                     local_file_path=checkpoint_save_path,
-                    blob_name=checkpoint_save_path 
+                    blob_name=checkpoint_filename
                 )
             except Exception as e:
                 print(f"Non-fatal: Failed to save checkpoint to Azure. Error: {e}")
