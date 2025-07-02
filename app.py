@@ -287,16 +287,12 @@ def main():
             }, checkpoint_save_path)
             print("✅ Checkpoint saved.")
   
-            try:
-                upload_checkpoint_to_azure(
+            upload_checkpoint_to_azure(
                     connection_string=connection_string,
                     container_name="resnet18",
                     local_file_path=checkpoint_save_path,
                     blob_name=checkpoint_filename
-                )
-            except Exception as e:
-                print(f"Non-fatal: Failed to save checkpoint to Azure. Error: {e}")
-                
+                )                
 
     # --- Save Final Model ---
     print(f"Saving final model backbone to local directory: {LOCAL_MODEL_OUTPUT_DIR}")
