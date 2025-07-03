@@ -274,7 +274,7 @@ def main():
         print(f"Epoch {epoch+1} - Average Loss: {avg_loss:.4f}")
 
         # Save checkpoint to the *local* directory every 5 epochs
-        if (epoch + 1) % 5 == 0:
+        if (epoch + 1) % 1 == 0:
             checkpoint_save_path = os.path.join(LOCAL_MODEL_OUTPUT_DIR, f"checkpoint_epoch_{epoch+1}.pth")
             print(f"Saving checkpoint to {checkpoint_save_path}...")
             torch.save({
@@ -291,7 +291,7 @@ def main():
                     connection_string=connection_string,
                     container_name="resnet18",
                     local_file_path=checkpoint_save_path,
-                    blob_name=checkpoint_filename
+                    blob_name=f"checkpoint_epoch_{epoch+1}.pth"
                 )                
 
     # --- Save Final Model ---
