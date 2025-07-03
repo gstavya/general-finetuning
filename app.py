@@ -203,7 +203,7 @@ def main():
 
     # Configuration for the checkpoint in Azure
     CHECKPOINT_CONTAINER = "resnet18"
-    CHECKPOINT_BLOB_NAME = "checkpoint_epoch_20.pth"
+    CHECKPOINT_BLOB_NAME = "checkpoint_epoch_29.pth"
 
     print(f"Attempting to load checkpoint '{CHECKPOINT_BLOB_NAME}' from Azure container '{CHECKPOINT_CONTAINER}'...")
 
