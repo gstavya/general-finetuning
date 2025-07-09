@@ -126,7 +126,7 @@ def main():
     LOCAL_MODEL_OUTPUT_DIR = '/mnt/satellite-resnet2'
     PATCH_SIZE = 224
     BATCH_SIZE = 256
-    NUM_EPOCHS = 50
+    NUM_EPOCHS = 100
     DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
     DATALOADER_WORKERS = 4 if torch.cuda.is_available() else 0
     LR = 1e-3
@@ -203,7 +203,7 @@ def main():
 
     # Configuration for the checkpoint in Azure
     CHECKPOINT_CONTAINER = "resnet18"
-    CHECKPOINT_BLOB_NAME = "checkpoint_epoch_29.pth"
+    CHECKPOINT_BLOB_NAME = "checkpoint_epoch_50.pth"
 
     print(f"Attempting to load checkpoint '{CHECKPOINT_BLOB_NAME}' from Azure container '{CHECKPOINT_CONTAINER}'...")
 
