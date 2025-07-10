@@ -5,3 +5,6 @@ tqdm
 Pillow
 azure-storage-blob
 numpy
+ultralytics
+opencv-python
+pyyaml
