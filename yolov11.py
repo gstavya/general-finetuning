@@ -1,240 +1,391 @@
 import os
-import json
+import io
 import yaml
-import shutil
+import torch
 from pathlib import Path
-import cv2
-import numpy as np
+from azure.storage.blob import BlobServiceClient
 from ultralytics import YOLO
+import multiprocessing
+from tqdm import tqdm
+import tempfile
+import warnings
 
-def convert_coco_to_yolo_seg(json_path, img_path, output_txt_path, category_mapping):
-    """
-    Convert COCO format segmentation annotations to YOLO format.
-    YOLO format: class_id x1 y1 x2 y2 ... xn yn (normalized coordinates)
-    """
-    # Read image to get dimensions
-    img = cv2.imread(img_path)
-    if img is None:
-        print(f"Warning: Could not read image {img_path}")
-        return False
-    
-    h, w = img.shape[:2]
-    
-    # Read JSON annotation
-    with open(json_path, 'r') as f:
-        data = json.load(f)
-    
-    # Open output file
-    with open(output_txt_path, 'w') as out_f:
-        # COCO format
-        if 'annotations' in data:
-            for ann in data['annotations']:
-                if 'segmentation' in ann and ann['segmentation']:
-                    # COCO category_id to YOLO class_id (0-indexed)
-                    coco_cat_id = ann['category_id']
-                    yolo_class_id = category_mapping.get(coco_cat_id, coco_cat_id - 1)
-                    
-                    # Process each polygon in segmentation
-                    for polygon in ann['segmentation']:
-                        if len(polygon) >= 6:  # At least 3 points
-                            # Normalize coordinates
-                            normalized_points = []
-                            for i in range(0, len(polygon), 2):
-                                x = polygon[i] / w
-                                y = polygon[i+1] / h
-                                # Clamp values to [0, 1]
-                                x = max(0, min(1, x))
-                                y = max(0, min(1, y))
-                                normalized_points.extend([x, y])
-                            
-                            # Write to file
-                            line = f"{yolo_class_id} " + " ".join(f"{p:.6f}" for p in normalized_points)
-                            out_f.write(line + '\n')
-    
-    return True
+# Set YOLO config directory to avoid permission warnings
+os.environ['YOLO_CONFIG_DIR'] = '/tmp/yolo_config'
 
-def load_coco_categories(json_dir):
-    """
-    Load category information from COCO format annotations.
-    """
-    categories = {}
-    category_mapping = {}
-    
-    # Check for a main annotation file or load from first JSON
-    json_files = list(Path(json_dir).glob('*.json'))
-    if json_files:
-        with open(json_files[0], 'r') as f:
-            data = json.load(f)
-            if 'categories' in data:
-                for cat in data['categories']:
-                    # Map COCO category_id to YOLO class_id (0-indexed)
-                    yolo_id = len(categories)
-                    categories[yolo_id] = cat['name']
-                    category_mapping[cat['id']] = yolo_id
-    
-    # If no categories found, create default
-    if not categories:
-        print("Warning: No categories found in annotations. Using default.")
-        categories = {0: 'object'}
-        category_mapping = None
-    
-    return categories, category_mapping
+# Suppress Ultralytics warnings during multiprocessing
+warnings.filterwarnings('ignore', message='user config directory')
+warnings.filterwarnings('ignore', message='Error decoding JSON')
 
-def prepare_dataset(source_dir, output_dir):
-    """
-    Prepare dataset in YOLO format structure from COCO format.
-    """
-    source_path = Path(source_dir)
-    output_path = Path(output_dir)
+def download_blob(args):
+    """Worker function to download a single blob."""
+    blob_name, connection_string, container_name, local_dir = args
     
-    # First, load categories from the dataset
-    print("Loading categories from COCO annotations...")
-    categories, category_mapping = load_coco_categories(source_path / 'train')
-    print(f"Found categories: {categories}")
+    # Suppress warnings in worker processes
+    import warnings
+    warnings.filterwarnings('ignore')
+    os.environ['YOLO_CONFIG_DIR'] = '/tmp/yolo_config'
     
-    # Create output directory structure
-    for split in ['train', 'valid']:
-        (output_path / 'images' / split).mkdir(parents=True, exist_ok=True)
-        (output_path / 'labels' / split).mkdir(parents=True, exist_ok=True)
+    try:
+        blob_service_client = BlobServiceClient.from_connection_string(connection_string)
+        blob_client = blob_service_client.get_blob_client(container=container_name, blob=blob_name)
+        
+        # Create local path maintaining directory structure
+        local_path = os.path.join(local_dir, blob_name)
+        os.makedirs(os.path.dirname(local_path), exist_ok=True)
+        
+        # Download blob
+        with open(local_path, "wb") as file:
+            download_stream = blob_client.download_blob()
+            file.write(download_stream.readall())
+        
+        return f"Downloaded {blob_name}"
+    except Exception as e:
+        return f"Failed to download {blob_name}: {e}"
+
+def download_from_azure(connection_string, container_name, local_dir):
+    """Download all files from Azure container to local directory."""
+    if os.path.exists(local_dir) and len(list(Path(local_dir).rglob('*'))) > 100:
+        print(f"Data already exists in '{local_dir}'. Skipping download.")
+        return
     
-    # Process each split
-    for split in ['train', 'valid']:
-        split_dir = source_path / split
+    print(f"Downloading data from Azure container '{container_name}' to '{local_dir}'...")
+    os.makedirs(local_dir, exist_ok=True)
+    
+    try:
+        blob_service_client = BlobServiceClient.from_connection_string(connection_string)
+        container_client = blob_service_client.get_container_client(container_name)
         
-        # Get all image files
-        img_files = list(split_dir.glob('*.jpg')) + list(split_dir.glob('*.jpeg')) + list(split_dir.glob('*.png'))
+        # List all blobs
+        blobs = list(container_client.list_blobs())
+        if not blobs:
+            print(f"Warning: No files found in container '{container_name}'.")
+            return
         
-        print(f"\nProcessing {split} split: {len(img_files)} images")
+        # Prepare download tasks
+        tasks = [(blob.name, connection_string, container_name, local_dir) for blob in blobs]
         
-        converted = 0
-        for img_file in img_files:
-            # Find corresponding JSON
-            json_file = img_file.with_suffix('.json')
+        # Download in parallel
+        with multiprocessing.Pool(processes=os.cpu_count()) as pool:
+            for _ in tqdm(pool.imap_unordered(download_blob, tasks), total=len(tasks), desc="Downloading files"):
+                pass
+        
+        print(f"✅ Download complete. All files saved to '{local_dir}'.")
+    
+    except Exception as e:
+        print(f"FATAL: Error downloading from Azure: {e}")
+        raise
+
+def save_checkpoint_to_azure(trainer, connection_string, container_name, blob_name):
+    """Save checkpoint directly to Azure without permanent local storage."""
+    try:
+        blob_service_client = BlobServiceClient.from_connection_string(connection_string)
+        
+        # Ensure container exists
+        try:
+            container_client = blob_service_client.create_container(container_name)
+            print(f"Container '{container_name}' created.")
+        except Exception:
+            container_client = blob_service_client.get_container_client(container_name)
+        
+        blob_client = container_client.get_blob_client(blob_name)
+        
+        # Use temporary file to save model
+        with tempfile.NamedTemporaryFile(suffix='.pt', delete=False) as tmp_file:
+            tmp_path = tmp_file.name
             
-            if json_file.exists():
-                # Copy image
-                shutil.copy(img_file, output_path / 'images' / split / img_file.name)
-                
-                # Convert and save annotation
-                txt_file = output_path / 'labels' / split / img_file.stem + '.txt'
-                if convert_coco_to_yolo_seg(json_file, str(img_file), txt_file, category_mapping):
-                    converted += 1
-            else:
-                print(f"Warning: No JSON found for {img_file}")
-        
-        print(f"Successfully converted {converted}/{len(img_files)} images in {split} split")
+        try:
+            # Save model to temporary file
+            trainer.save_model(tmp_path)
+            
+            # Upload directly from temporary file to Azure
+            print(f"Uploading checkpoint to Azure as blob: {blob_name}...")
+            with open(tmp_path, "rb") as data:
+                blob_client.upload_blob(data, overwrite=True)
+            print("✅ Checkpoint successfully uploaded to Azure.")
+            
+        finally:
+            # Always clean up temporary file
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
     
-    return categories
+    except Exception as e:
+        print(f"WARNING: Failed to upload checkpoint to Azure. Error: {e}")
 
-def create_yaml_config(data_dir, class_names, yaml_path):
-    """
-    Create YAML configuration file for YOLOv11 training.
-    """
-    config = {
-        'path': str(Path(data_dir).absolute()),
-        'train': 'images/train',
-        'val': 'images/valid',
-        'names': {i: name for i, name in enumerate(class_names)}
-    }
-    
-    with open(yaml_path, 'w') as f:
-        yaml.dump(config, f, default_flow_style=False)
-    
-    return yaml_path
+def download_checkpoint_from_azure(connection_string, container_name, blob_name):
+    """Download checkpoint from Azure to temporary file."""
+    try:
+        blob_service_client = BlobServiceClient.from_connection_string(connection_string)
+        blob_client = blob_service_client.get_blob_client(container=container_name, blob=blob_name)
+        
+        # Create temporary file
+        with tempfile.NamedTemporaryFile(suffix='.pt', delete=False) as tmp_file:
+            tmp_path = tmp_file.name
+        
+        # Download to temporary file
+        with open(tmp_path, "wb") as f:
+            f.write(blob_client.download_blob().readall())
+        
+        return tmp_path
+    except Exception as e:
+        print(f"Failed to download checkpoint: {e}")
+        return None
 
-def train_yolov11_seg():
-    """
-    Main function to prepare data and train YOLOv11-seg model.
-    """
-    # Configuration
-    source_dir = "final_roboflow_2_1_1"  # Your source directory
-    output_dir = "yolo_dataset"  # Processed dataset directory
-    yaml_path = "dataset.yaml"  # YAML config file
+def create_data_yaml(local_data_dir):
+    """Create data.yaml file for YOLO training."""
+    data_yaml_path = os.path.join(local_data_dir, 'data.yaml')
     
-    # Step 1: Prepare dataset
-    print("=== Preparing Dataset ===")
-    categories = prepare_dataset(source_dir, output_dir)
-    
-    # Get class names from categories
-    class_names = [categories[i] for i in sorted(categories.keys())]
-    
-    # Step 2: Create YAML configuration
-    print("\n=== Creating YAML Configuration ===")
-    yaml_path = create_yaml_config(output_dir, class_names, yaml_path)
-    print(f"YAML config saved to: {yaml_path}")
-    
-    # Step 3: Train the model
-    print("\n=== Starting YOLOv11-seg Training ===")
-    
-    # Initialize YOLOv11-seg model (small version)
-    model = YOLO('yolov11s-seg.pt')  # Download/load pretrained weights
-    
-    # Train the model
-    results = model.train(
-        data=yaml_path,           # Path to YAML config
-        epochs=100,              # Number of epochs
-        imgsz=640,               # Image size
-        batch=16,                # Batch size (adjust based on GPU memory)
-        device=0,                # GPU device (use 'cpu' if no GPU)
-        workers=8,               # Number of dataloader workers
-        patience=50,             # Early stopping patience
-        save=True,               # Save checkpoints
-        save_period=10,          # Save every N epochs
-        project='runs/segment',  # Project directory
-        name='yolov11s_seg',     # Experiment name
-        exist_ok=True,           # Overwrite existing project/name
-        pretrained=True,         # Use pretrained weights
-        optimizer='auto',        # Optimizer
-        verbose=True,            # Verbose output
-        seed=42,                 # Random seed for reproducibility
-        deterministic=True,      # Deterministic training
-        single_cls=False,        # Single class training
-        rect=False,              # Rectangular training
-        cos_lr=False,            # Cosine LR scheduler
-        close_mosaic=10,         # Disable mosaic for last N epochs
-        amp=True,                # Automatic Mixed Precision training
-        fraction=1.0,            # Dataset fraction to train on
-        profile=False,           # Profile ONNX and TensorRT speeds
-        freeze=None,             # Freeze first N layers
+    # Check if data.yaml already exists in the downloaded data
+    if os.path.exists(data_yaml_path):
+        print(f"Using existing data.yaml from {data_yaml_path}")
+        # Update paths to be absolute
+        with open(data_yaml_path, 'r') as f:
+            data_config = yaml.safe_load(f)
         
-        # Augmentation parameters
-        hsv_h=0.015,            # HSV-Hue augmentation
-        hsv_s=0.7,              # HSV-Saturation augmentation
-        hsv_v=0.4,              # HSV-Value augmentation
-        degrees=0.0,            # Rotation augmentation
-        translate=0.1,          # Translation augmentation
-        scale=0.5,              # Scale augmentation
-        shear=0.0,              # Shear augmentation
-        perspective=0.0,        # Perspective augmentation
-        flipud=0.0,             # Vertical flip augmentation
-        fliplr=0.5,             # Horizontal flip augmentation
-        mosaic=1.0,             # Mosaic augmentation
-        mixup=0.0,              # MixUp augmentation
-        copy_paste=0.0,         # Copy-Paste augmentation (for segments)
+        # Update paths to absolute paths
+        data_config['path'] = os.path.abspath(local_data_dir)
+        if 'train' in data_config:
+            data_config['train'] = os.path.join(os.path.abspath(local_data_dir), 'train/images')
+        if 'val' in data_config:
+            data_config['val'] = os.path.join(os.path.abspath(local_data_dir), 'valid/images')
+        if 'test' in data_config:
+            data_config['test'] = os.path.join(os.path.abspath(local_data_dir), 'test/images')
         
-        # Segmentation specific
-        overlap_mask=True,       # Overlap masks during training
-        mask_ratio=4,           # Mask downsample ratio
+        # Save updated config
+        updated_yaml_path = os.path.join(local_data_dir, 'data_updated.yaml')
+        with open(updated_yaml_path, 'w') as f:
+            yaml.dump(data_config, f, default_flow_style=False)
+        
+        return updated_yaml_path
+    
+    else:
+        # Create new data.yaml if it doesn't exist
+        print("Creating new data.yaml file...")
+        data_config = {
+            'path': os.path.abspath(local_data_dir),
+            'train': os.path.join(os.path.abspath(local_data_dir), 'train/images'),
+            'val': os.path.join(os.path.abspath(local_data_dir), 'valid/images'),
+            'test': os.path.join(os.path.abspath(local_data_dir), 'test/images'),
+            'nc': 1,  # Number of classes
+            'names': ['sidewalk']  # Class names
+        }
+        
+        with open(data_yaml_path, 'w') as f:
+            yaml.dump(data_config, f, default_flow_style=False)
+        
+        return data_yaml_path
+
+def main():
+    # --- Configuration ---
+    SOURCE_DATA_CONTAINER = "testsidewalk60"
+    CHECKPOINT_CONTAINER = "testyolosidewalk60"
+    LOCAL_DATA_DIR = "/mnt/data/yolo_sidewalk"
+    NUM_EPOCHS = 300
+    BATCH_SIZE = 64  # Total batch size across all GPUs
+    DEVICE = '0,1,2,3'  # Use 4 GPUs
+    SAVE_PERIOD = 5
+    
+    # Create YOLO config directory
+    os.makedirs('/tmp/yolo_config', exist_ok=True)
+    
+    # Azure connection string
+    connection_string = "DefaultEndpointsProtocol=https;AccountName=resnettrainingdata;AccountKey=afq0lgt0sj3lq1+b3Y6eeIg+JArkqE5UJL7tHSeM+Bxa0S3aQSK9ZRMZHozG1PJx2rGfwBh7DySr+ASt3w6JmA==;EndpointSuffix=core.windows.net"
+    
+    print(f"Using devices: {DEVICE}")
+    print(f"Total batch size: {BATCH_SIZE} (will be split across 4 GPUs)")
+    
+    # Download data from Azure
+    download_from_azure(
+        connection_string=connection_string,
+        container_name=SOURCE_DATA_CONTAINER,
+        local_dir=LOCAL_DATA_DIR
     )
     
-    print("\n=== Training Complete ===")
-    print(f"Best model saved to: {model.trainer.best}")
-    print(f"Last model saved to: {model.trainer.last}")
+    # Create/update data.yaml
+    data_yaml_path = create_data_yaml(LOCAL_DATA_DIR)
+    print(f"Data configuration file: {data_yaml_path}")
     
-    # Validate the model
-    print("\n=== Validating Model ===")
-    metrics = model.val()
+    # Initialize YOLO model
+    print("Initializing YOLOv11s-seg model...")
+    model = YOLO('yolo11s-seg.pt')
     
-    print("\nValidation Results:")
-    print(f"Box mAP50-95: {metrics.box.map}")
-    print(f"Mask mAP50-95: {metrics.seg.map}")
+    # Check for existing checkpoint in Azure
+    start_epoch = 0
+    latest_checkpoint = None
+    temp_checkpoint_path = None
     
-    return model
+    print(f"Checking for existing checkpoints in Azure container '{CHECKPOINT_CONTAINER}'...")
+    try:
+        blob_service_client = BlobServiceClient.from_connection_string(connection_string)
+        container_client = blob_service_client.get_container_client(CHECKPOINT_CONTAINER)
+        
+        # List all checkpoint blobs
+        checkpoints = [blob.name for blob in container_client.list_blobs() if blob.name.startswith('checkpoint_epoch_')]
+        
+        if checkpoints:
+            # Sort to find latest
+            checkpoints.sort(key=lambda x: int(x.split('_')[-1].split('.')[0]))
+            latest_checkpoint = checkpoints[-1]
+            latest_epoch = int(latest_checkpoint.split('_')[-1].split('.')[0])
+            
+            print(f"Found checkpoint: {latest_checkpoint}")
+            
+            # Download checkpoint to temporary file
+            temp_checkpoint_path = download_checkpoint_from_azure(
+                connection_string, CHECKPOINT_CONTAINER, latest_checkpoint
+            )
+            
+            if temp_checkpoint_path:
+                # Load the checkpoint
+                model = YOLO(temp_checkpoint_path)
+                start_epoch = latest_epoch
+                print(f"✅ Loaded checkpoint from epoch {start_epoch}")
+    
+    except Exception as e:
+        print(f"No existing checkpoints found or error loading: {e}")
+        print("Starting training from scratch...")
+    
+    finally:
+        # Clean up temporary checkpoint file
+        if temp_checkpoint_path and os.path.exists(temp_checkpoint_path):
+            os.remove(temp_checkpoint_path)
+    
+    # Store connection string and container name for callback
+    callback_config = {
+        'connection_string': connection_string,
+        'container_name': CHECKPOINT_CONTAINER,
+        'save_period': SAVE_PERIOD,
+        'data_yaml': data_yaml_path
+    }
+    
+    # Custom training callback to save checkpoints directly to Azure
+    def on_epoch_end(trainer):
+        """Callback to save checkpoint every SAVE_PERIOD epochs directly to Azure."""
+        epoch = trainer.epoch + 1
+        
+        if epoch % callback_config['save_period'] == 0:
+            checkpoint_name = f"checkpoint_epoch_{epoch}.pt"
+            
+            # Save directly to Azure
+            save_checkpoint_to_azure(
+                trainer,
+                callback_config['connection_string'],
+                callback_config['container_name'],
+                checkpoint_name
+            )
+    
+    # Custom callback to display validation metrics after each epoch
+    def on_train_epoch_end(trainer):
+        """Callback to display validation metrics after each epoch."""
+        epoch = trainer.epoch + 1
+        print(f"\n--- Epoch {epoch} Validation Metrics ---")
+        
+        try:
+            # Run validation on the validation set
+            metrics = trainer.model.val(data=callback_config['data_yaml'], verbose=False)
+            
+            # Display box metrics
+            print(f"Box Metrics:")
+            print(f"  Precision: {metrics.box.p.mean():.4f}")
+            print(f"  Recall: {metrics.box.r.mean():.4f}")
+            print(f"  mAP50: {metrics.box.map50:.4f}")
+            print(f"  mAP50-95: {metrics.box.map:.4f}")
+            
+            # Display mask metrics
+            print(f"Mask Metrics:")
+            print(f"  Precision: {metrics.seg.p.mean():.4f}")
+            print(f"  Recall: {metrics.seg.r.mean():.4f}")
+            print(f"  mAP50: {metrics.seg.map50:.4f}")
+            print(f"  mAP50-95: {metrics.seg.map:.4f}")
+            print("------------------------------------\n")
+            
+        except Exception as e:
+            print(f"Error calculating validation metrics: {e}")
+            print("------------------------------------\n")
+    
+    # Add callbacks to model
+    model.add_callback("on_epoch_end", on_epoch_end)
+    model.add_callback("on_train_epoch_end", on_train_epoch_end)
+    
+    # Use temporary directory for YOLO's internal outputs
+    with tempfile.TemporaryDirectory() as temp_project_dir:
+        # Train the model
+        print(f"\nStarting training from epoch {start_epoch + 1} to {NUM_EPOCHS}...")
+        results = model.train(
+            data=data_yaml_path,
+            epochs=NUM_EPOCHS,
+            batch=BATCH_SIZE,
+            imgsz=640,
+            device=DEVICE,  # Multi-GPU training
+            workers=8,
+            patience=0,  # Disable early stopping - train for all 300 epochs
+            save=True,
+            save_period=-1,  # Disable default saving, we handle it in callback
+            project=temp_project_dir,  # Use temp directory for YOLO outputs
+            name='yolov11s_seg_sidewalk',
+            exist_ok=True,
+            pretrained=True if start_epoch == 0 else False,
+            resume=True if start_epoch > 0 else False,
+            optimizer='auto',
+            verbose=True,
+            seed=42,
+            deterministic=True,
+            single_cls=True,  # Since we only have sidewalk class
+            amp=True,  # Mixed precision for faster training
+            
+            # Augmentation parameters
+            hsv_h=0.015,
+            hsv_s=0.7,
+            hsv_v=0.4,
+            degrees=0.0,
+            translate=0.1,
+            scale=0.5,
+            shear=0.0,
+            perspective=0.0,
+            flipud=0.0,
+            fliplr=0.5,
+            mosaic=1.0,
+            mixup=0.0,
+            copy_paste=0.0,
+            
+            # Segmentation specific
+            overlap_mask=True,
+            mask_ratio=4,
+        )
+        
+        # Save final model directly to Azure
+        print("\nSaving final model to Azure...")
+        final_blob_name = "yolov11s_seg_sidewalk_final.pt"
+        
+        # Get the best model path from trainer
+        best_model_path = os.path.join(temp_project_dir, 'yolov11s_seg_sidewalk', 'weights', 'best.pt')
+        
+        if os.path.exists(best_model_path):
+            # Upload best model directly to Azure
+            try:
+                blob_service_client = BlobServiceClient.from_connection_string(connection_string)
+                blob_client = blob_service_client.get_blob_client(
+                    container=CHECKPOINT_CONTAINER, 
+                    blob=final_blob_name
+                )
+                
+                with open(best_model_path, "rb") as data:
+                    blob_client.upload_blob(data, overwrite=True)
+                print(f"✅ Final model uploaded to Azure as: {final_blob_name}")
+            except Exception as e:
+                print(f"Failed to upload final model: {e}")
+        
+        # Validate the model
+        print("\n=== Running Final Validation ===")
+        metrics = model.val()
+        print(f"Box mAP50-95: {metrics.box.map}")
+        print(f"Mask mAP50-95: {metrics.seg.map}")
+    
+    print("\n✅ Training complete!")
 
-if __name__ == "__main__":
-    # Run the training
-    trained_model = train_yolov11_seg()
+if __name__ == '__main__':
+    # Set multiprocessing start method
+    if multiprocessing.get_start_method(allow_none=True) != 'spawn':
+        multiprocessing.set_start_method('spawn', force=True)
     
-    # Optional: Export the model to other formats
-    # trained_model.export(format='onnx')  # Export to ONNX
-    # trained_model.export(format='torchscript')  # Export to TorchScript
+    main()
