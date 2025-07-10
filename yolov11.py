@@ -7,6 +7,7 @@ from azure.storage.blob import BlobServiceClient
 from ultralytics import YOLO
 import multiprocessing
 from tqdm import tqdm
+import tempfile
 
 def download_blob(args):
     """Worker function to download a single blob."""
@@ -61,8 +62,8 @@ def download_from_azure(connection_string, container_name, local_dir):
         print(f"FATAL: Error downloading from Azure: {e}")
         raise
 
-def upload_checkpoint_to_azure(connection_string, container_name, local_file_path, blob_name):
-    """Upload a checkpoint file to Azure Blob Storage."""
+def save_checkpoint_to_azure(trainer, connection_string, container_name, blob_name):
+    """Save checkpoint directly to Azure without permanent local storage."""
     try:
         blob_service_client = BlobServiceClient.from_connection_string(connection_string)
         
@@ -72,17 +73,49 @@ def upload_checkpoint_to_azure(connection_string, container_name, local_file_pat
             print(f"Container '{container_name}' created.")
         except Exception:
             container_client = blob_service_client.get_container_client(container_name)
-            print(f"Container '{container_name}' already exists.")
         
         blob_client = container_client.get_blob_client(blob_name)
         
-        print(f"Uploading checkpoint to Azure as blob: {blob_name}...")
-        with open(local_file_path, "rb") as data:
-            blob_client.upload_blob(data, overwrite=True)
-        print("✅ Checkpoint successfully uploaded to Azure.")
+        # Use temporary file to save model
+        with tempfile.NamedTemporaryFile(suffix='.pt', delete=False) as tmp_file:
+            tmp_path = tmp_file.name
+            
+        try:
+            # Save model to temporary file
+            trainer.save_model(tmp_path)
+            
+            # Upload directly from temporary file to Azure
+            print(f"Uploading checkpoint to Azure as blob: {blob_name}...")
+            with open(tmp_path, "rb") as data:
+                blob_client.upload_blob(data, overwrite=True)
+            print("✅ Checkpoint successfully uploaded to Azure.")
+            
+        finally:
+            # Always clean up temporary file
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
     
     except Exception as e:
         print(f"WARNING: Failed to upload checkpoint to Azure. Error: {e}")
+
+def download_checkpoint_from_azure(connection_string, container_name, blob_name):
+    """Download checkpoint from Azure to temporary file."""
+    try:
+        blob_service_client = BlobServiceClient.from_connection_string(connection_string)
+        blob_client = blob_service_client.get_blob_client(container=container_name, blob=blob_name)
+        
+        # Create temporary file
+        with tempfile.NamedTemporaryFile(suffix='.pt', delete=False) as tmp_file:
+            tmp_path = tmp_file.name
+        
+        # Download to temporary file
+        with open(tmp_path, "wb") as f:
+            f.write(blob_client.download_blob().readall())
+        
+        return tmp_path
+    except Exception as e:
+        print(f"Failed to download checkpoint: {e}")
+        return None
 
 def create_data_yaml(local_data_dir):
     """Create data.yaml file for YOLO training."""
@@ -130,20 +163,16 @@ def create_data_yaml(local_data_dir):
 
 def main():
     # --- Configuration ---
-    SOURCE_DATA_CONTAINER = "sidewalk60"
-    CHECKPOINT_CONTAINER = "yolosidewalk60"
+    SOURCE_DATA_CONTAINER = "testsidewalk60"
+    CHECKPOINT_CONTAINER = "testyolosidewalk60"
     LOCAL_DATA_DIR = "/mnt/data/yolo_sidewalk"
-    LOCAL_MODEL_OUTPUT_DIR = "/mnt/yolo_checkpoints"
     NUM_EPOCHS = 300
     BATCH_SIZE = 64  # Total batch size across all GPUs
     DEVICE = '0,1,2,3'  # Use 4 GPUs
     SAVE_PERIOD = 5
     
-    # Azure connection string - PLACEHOLDER
-    connection_string = ""
-    
-    if connection_string == "DefaultEndpointsProtocol=https;AccountName=resnettrainingdata;AccountKey=afq0lgt0sj3lq1+b3Y6eeIg+JArkqE5UJL7tHSeM+Bxa0S3aQSK9ZRMZHozG1PJx2rGfwBh7DySr+ASt3w6JmA==;EndpointSuffix=core.windows.net":
-        raise ValueError("Please set the Azure Storage connection string.")
+    # Azure connection string
+    connection_string = "DefaultEndpointsProtocol=https;AccountName=resnettrainingdata;AccountKey=afq0lgt0sj3lq1+b3Y6eeIg+JArkqE5UJL7tHSeM+Bxa0S3aQSK9ZRMZHozG1PJx2rGfwBh7DySr+ASt3w6JmA==;EndpointSuffix=core.windows.net"
     
     print(f"Using devices: {DEVICE}")
     print(f"Total batch size: {BATCH_SIZE} (will be split across 4 GPUs)")
@@ -159,9 +188,6 @@ def main():
     data_yaml_path = create_data_yaml(LOCAL_DATA_DIR)
     print(f"Data configuration file: {data_yaml_path}")
     
-    # Create output directory
-    os.makedirs(LOCAL_MODEL_OUTPUT_DIR, exist_ok=True)
-    
     # Initialize YOLO model
     print("Initializing YOLOv11s-seg model...")
     model = YOLO('yolov11s-seg.pt')
@@ -169,6 +195,7 @@ def main():
     # Check for existing checkpoint in Azure
     start_epoch = 0
     latest_checkpoint = None
+    temp_checkpoint_path = None
     
     print(f"Checking for existing checkpoints in Azure container '{CHECKPOINT_CONTAINER}'...")
     try:
@@ -186,110 +213,125 @@ def main():
             
             print(f"Found checkpoint: {latest_checkpoint}")
             
-            # Download and load the checkpoint
-            local_checkpoint_path = os.path.join(LOCAL_MODEL_OUTPUT_DIR, latest_checkpoint)
-            blob_client = container_client.get_blob_client(latest_checkpoint)
+            # Download checkpoint to temporary file
+            temp_checkpoint_path = download_checkpoint_from_azure(
+                connection_string, CHECKPOINT_CONTAINER, latest_checkpoint
+            )
             
-            with open(local_checkpoint_path, "wb") as f:
-                f.write(blob_client.download_blob().readall())
-            
-            # Load the checkpoint
-            model = YOLO(local_checkpoint_path)
-            start_epoch = latest_epoch
-            print(f"✅ Loaded checkpoint from epoch {start_epoch}")
+            if temp_checkpoint_path:
+                # Load the checkpoint
+                model = YOLO(temp_checkpoint_path)
+                start_epoch = latest_epoch
+                print(f"✅ Loaded checkpoint from epoch {start_epoch}")
     
     except Exception as e:
         print(f"No existing checkpoints found or error loading: {e}")
         print("Starting training from scratch...")
     
-    # Custom training callback to save checkpoints
+    finally:
+        # Clean up temporary checkpoint file
+        if temp_checkpoint_path and os.path.exists(temp_checkpoint_path):
+            os.remove(temp_checkpoint_path)
+    
+    # Store connection string and container name for callback
+    callback_config = {
+        'connection_string': connection_string,
+        'container_name': CHECKPOINT_CONTAINER,
+        'save_period': SAVE_PERIOD
+    }
+    
+    # Custom training callback to save checkpoints directly to Azure
     def on_epoch_end(trainer):
-        """Callback to save checkpoint every SAVE_PERIOD epochs."""
+        """Callback to save checkpoint every SAVE_PERIOD epochs directly to Azure."""
         epoch = trainer.epoch + 1
         
-        if epoch % SAVE_PERIOD == 0:
-            # Save checkpoint locally
+        if epoch % callback_config['save_period'] == 0:
             checkpoint_name = f"checkpoint_epoch_{epoch}.pt"
-            checkpoint_path = os.path.join(LOCAL_MODEL_OUTPUT_DIR, checkpoint_name)
             
-            # Save the entire model (not just weights)
-            trainer.save_model(checkpoint_path)
-            print(f"✅ Checkpoint saved locally: {checkpoint_path}")
-            
-            # Upload to Azure
-            upload_checkpoint_to_azure(
-                connection_string=connection_string,
-                container_name=CHECKPOINT_CONTAINER,
-                local_file_path=checkpoint_path,
-                blob_name=checkpoint_name
+            # Save directly to Azure
+            save_checkpoint_to_azure(
+                trainer,
+                callback_config['connection_string'],
+                callback_config['container_name'],
+                checkpoint_name
             )
     
     # Add callback to model
     model.add_callback("on_epoch_end", on_epoch_end)
     
-    # Train the model
-    print(f"\nStarting training from epoch {start_epoch + 1} to {NUM_EPOCHS}...")
-    results = model.train(
-        data=data_yaml_path,
-        epochs=NUM_EPOCHS,
-        batch=BATCH_SIZE,
-        imgsz=640,
-        device=DEVICE,  # Multi-GPU training
-        workers=8,
-        patience=50,
-        save=True,
-        save_period=-1,  # Disable default saving, we handle it in callback
-        project=LOCAL_MODEL_OUTPUT_DIR,
-        name='yolov11s_seg_sidewalk',
-        exist_ok=True,
-        pretrained=True if start_epoch == 0 else False,
-        resume=True if start_epoch > 0 else False,
-        optimizer='auto',
-        verbose=True,
-        seed=42,
-        deterministic=True,
-        single_cls=True,  # Since we only have sidewalk class
-        amp=True,  # Mixed precision for faster training
+    # Use temporary directory for YOLO's internal outputs
+    with tempfile.TemporaryDirectory() as temp_project_dir:
+        # Train the model
+        print(f"\nStarting training from epoch {start_epoch + 1} to {NUM_EPOCHS}...")
+        results = model.train(
+            data=data_yaml_path,
+            epochs=NUM_EPOCHS,
+            batch=BATCH_SIZE,
+            imgsz=640,
+            device=DEVICE,  # Multi-GPU training
+            workers=8,
+            patience=50,
+            save=True,
+            save_period=-1,  # Disable default saving, we handle it in callback
+            project=temp_project_dir,  # Use temp directory for YOLO outputs
+            name='yolov11s_seg_sidewalk',
+            exist_ok=True,
+            pretrained=True if start_epoch == 0 else False,
+            resume=True if start_epoch > 0 else False,
+            optimizer='auto',
+            verbose=True,
+            seed=42,
+            deterministic=True,
+            single_cls=True,  # Since we only have sidewalk class
+            amp=True,  # Mixed precision for faster training
+            
+            # Augmentation parameters
+            hsv_h=0.015,
+            hsv_s=0.7,
+            hsv_v=0.4,
+            degrees=0.0,
+            translate=0.1,
+            scale=0.5,
+            shear=0.0,
+            perspective=0.0,
+            flipud=0.0,
+            fliplr=0.5,
+            mosaic=1.0,
+            mixup=0.0,
+            copy_paste=0.0,
+            
+            # Segmentation specific
+            overlap_mask=True,
+            mask_ratio=4,
+        )
         
-        # Augmentation parameters
-        hsv_h=0.015,
-        hsv_s=0.7,
-        hsv_v=0.4,
-        degrees=0.0,
-        translate=0.1,
-        scale=0.5,
-        shear=0.0,
-        perspective=0.0,
-        flipud=0.0,
-        fliplr=0.5,
-        mosaic=1.0,
-        mixup=0.0,
-        copy_paste=0.0,
+        # Save final model directly to Azure
+        print("\nSaving final model to Azure...")
+        final_blob_name = "yolov11s_seg_sidewalk_final.pt"
         
-        # Segmentation specific
-        overlap_mask=True,
-        mask_ratio=4,
-    )
-    
-    # Save final model
-    print("\nSaving final model...")
-    final_model_path = os.path.join(LOCAL_MODEL_OUTPUT_DIR, "yolov11s_seg_sidewalk_final.pt")
-    model.save(final_model_path)
-    print(f"✅ Final model saved to: {final_model_path}")
-    
-    # Upload final model to Azure
-    upload_checkpoint_to_azure(
-        connection_string=connection_string,
-        container_name=CHECKPOINT_CONTAINER,
-        local_file_path=final_model_path,
-        blob_name="yolov11s_seg_sidewalk_final.pt"
-    )
-    
-    # Validate the model
-    print("\n=== Running Final Validation ===")
-    metrics = model.val()
-    print(f"Box mAP50-95: {metrics.box.map}")
-    print(f"Mask mAP50-95: {metrics.seg.map}")
+        # Get the best model path from trainer
+        best_model_path = os.path.join(temp_project_dir, 'yolov11s_seg_sidewalk', 'weights', 'best.pt')
+        
+        if os.path.exists(best_model_path):
+            # Upload best model directly to Azure
+            try:
+                blob_service_client = BlobServiceClient.from_connection_string(connection_string)
+                blob_client = blob_service_client.get_blob_client(
+                    container=CHECKPOINT_CONTAINER, 
+                    blob=final_blob_name
+                )
+                
+                with open(best_model_path, "rb") as data:
+                    blob_client.upload_blob(data, overwrite=True)
+                print(f"✅ Final model uploaded to Azure as: {final_blob_name}")
+            except Exception as e:
+                print(f"Failed to upload final model: {e}")
+        
+        # Validate the model
+        print("\n=== Running Final Validation ===")
+        metrics = model.val()
+        print(f"Box mAP50-95: {metrics.box.map}")
+        print(f"Mask mAP50-95: {metrics.seg.map}")
     
     print("\n✅ Training complete!")
 
