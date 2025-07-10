@@ -190,7 +190,7 @@ def main():
     
     # Initialize YOLO model
     print("Initializing YOLOv11s-seg model...")
-    model = YOLO('yolov11s-seg.pt')
+    model = YOLO('yolo11s-seg.pt')
     
     # Check for existing checkpoint in Azure
     start_epoch = 0
