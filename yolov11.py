@@ -81,6 +81,8 @@ def download_from_azure(connection_string, container_name, local_dir):
 def save_full_checkpoint_to_azure(trainer, connection_string, container_name, epoch):
     """Save complete checkpoint with all training state to Azure."""
     try:
+        print(f"\n🔄 Starting checkpoint save for epoch {epoch}...")
+        
         blob_service_client = BlobServiceClient.from_connection_string(connection_string)
         
         # Ensure container exists
@@ -98,10 +100,12 @@ def save_full_checkpoint_to_azure(trainer, connection_string, container_name, ep
             # Save the model weights
             weights_path = os.path.join(checkpoint_dir, 'weights.pt')
             trainer.save_model(weights_path)
+            print(f"  ✓ Model weights saved")
             
             # Save optimizer state
             optimizer_path = os.path.join(checkpoint_dir, 'optimizer.pt')
             torch.save(trainer.optimizer.state_dict(), optimizer_path)
+            print(f"  ✓ Optimizer state saved")
             
             # Save training args and state
             training_state = {
@@ -115,26 +119,31 @@ def save_full_checkpoint_to_azure(trainer, connection_string, container_name, ep
             
             state_path = os.path.join(checkpoint_dir, 'training_state.pt')
             torch.save(training_state, state_path)
+            print(f"  ✓ Training state saved")
             
             # Save results CSV if exists
             if hasattr(trainer, 'csv') and trainer.csv and os.path.exists(trainer.csv):
                 shutil.copy(trainer.csv, os.path.join(checkpoint_dir, 'results.csv'))
+                print(f"  ✓ Results CSV saved")
             
             # Create a tar archive of the checkpoint directory
             tar_path = os.path.join(temp_dir, f'checkpoint_epoch_{epoch}.tar')
             shutil.make_archive(tar_path.replace('.tar', ''), 'tar', checkpoint_dir)
+            print(f"  ✓ Archive created")
             
             # Upload the tar file to Azure
             blob_name = f'checkpoint_epoch_{epoch}.tar'
             blob_client = container_client.get_blob_client(blob_name)
             
-            print(f"Uploading complete checkpoint to Azure as: {blob_name}...")
+            print(f"  📤 Uploading to Azure as: {blob_name}...")
             with open(tar_path, "rb") as data:
                 blob_client.upload_blob(data, overwrite=True)
-            print(f"✅ Checkpoint for epoch {epoch} successfully uploaded to Azure.")
+            print(f"✅ Checkpoint for epoch {epoch} successfully uploaded to Azure!\n")
     
     except Exception as e:
-        print(f"WARNING: Failed to upload checkpoint to Azure. Error: {e}")
+        print(f"❌ WARNING: Failed to upload checkpoint to Azure. Error: {e}\n")
+        import traceback
+        traceback.print_exc()
 
 def download_and_extract_checkpoint(connection_string, container_name, blob_name, extract_dir):
     """Download and extract checkpoint from Azure."""
@@ -303,17 +312,23 @@ def main():
         'container_name': CHECKPOINT_CONTAINER,
         'save_period': SAVE_PERIOD,
         'data_yaml': data_yaml_path,
-        'start_epoch': start_epoch
+        'start_epoch': start_epoch,
+        'epoch_counter': 0  # Track epochs manually
     }
     
     # Custom training callback to save complete checkpoints
     def on_train_epoch_end(trainer):
         """Callback to save complete checkpoint and display metrics."""
+        # Increment epoch counter
+        callback_config['epoch_counter'] += 1
+        
         # Calculate actual epoch considering resume
-        actual_epoch = callback_config['start_epoch'] + trainer.epoch + 1
+        actual_epoch = callback_config['start_epoch'] + callback_config['epoch_counter']
         
         # Display validation metrics
         print(f"\n--- Epoch {actual_epoch} Validation Metrics ---")
+        print(f"(Internal epoch: {trainer.epoch + 1}, Counter: {callback_config['epoch_counter']})")
+        
         try:
             metrics = trainer.model.val(data=callback_config['data_yaml'], verbose=False)
             
@@ -335,6 +350,25 @@ def main():
         
         # Save checkpoint every SAVE_PERIOD epochs
         if actual_epoch % callback_config['save_period'] == 0:
+            print(f"📸 Saving checkpoint at epoch {actual_epoch} (divisible by {callback_config['save_period']})")
+            save_full_checkpoint_to_azure(
+                trainer,
+                callback_config['connection_string'],
+                callback_config['container_name'],
+                actual_epoch
+            )
+        else:
+            print(f"ℹ️  Epoch {actual_epoch} - Not saving (next save at epoch {((actual_epoch // callback_config['save_period']) + 1) * callback_config['save_period']})")
+    
+    # Also add a callback that runs after each epoch completes (alternative hook)
+    def on_train_epoch_end_alt(trainer):
+        """Alternative callback using on_epoch_end hook."""
+        # This might work better for checkpoint saving
+        callback_config['epoch_counter'] = trainer.epoch + 1
+        actual_epoch = callback_config['start_epoch'] + callback_config['epoch_counter']
+        
+        if actual_epoch % callback_config['save_period'] == 0:
+            print(f"📸 [Alt] Saving checkpoint at epoch {actual_epoch}")
             save_full_checkpoint_to_azure(
                 trainer,
                 callback_config['connection_string'],
@@ -342,8 +376,10 @@ def main():
                 actual_epoch
             )
     
-    # Add callback to model
+    # Add callbacks to model
     model.add_callback("on_train_epoch_end", on_train_epoch_end)
+    # Try both hooks to ensure we catch the epoch end
+    model.add_callback("on_epoch_end", on_train_epoch_end_alt)
     
     # Use temporary directory for YOLO's internal outputs
     with tempfile.TemporaryDirectory() as temp_project_dir:
