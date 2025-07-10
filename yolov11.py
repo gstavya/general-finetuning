@@ -222,7 +222,7 @@ def main():
     CHECKPOINT_CONTAINER = "testyolosidewalk60"
     LOCAL_DATA_DIR = "/mnt/data/yolo_sidewalk"
     NUM_EPOCHS = 300
-    BATCH_SIZE = 64  # Total batch size across all GPUs
+    BATCH_SIZE = 1024  # Total batch size across all GPUs
     DEVICE = '0,1,2,3'  # Use 4 GPUs
     SAVE_PERIOD = 5
     
@@ -406,7 +406,7 @@ def main():
             'save': True,
             'save_period': -1,  # Disable default saving
             'project': temp_project_dir,
-            'name': 'yolov11s_seg_sidewalk',
+            'name': 'yolov11x_seg_sidewalk',
             'exist_ok': True,
             'pretrained': False,  # Already have a model
             'resume': resume_path if resume_path and os.path.exists(resume_path) else False,
