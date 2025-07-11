@@ -212,7 +212,7 @@ def main():
 
     # --- Initialize Model Structure (No changes) ---
     print("Initializing ResNet-18 model structure...")
-    backbone = resnet18(weights=None)
+    backbone = resnet18(weights=IMAGENET1K_V1)
     backbone.fc = nn.Identity()
     online_network = nn.Sequential(
         backbone,
