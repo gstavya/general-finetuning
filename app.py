@@ -147,7 +147,7 @@ def main_worker(rank, world_size):
     LOCAL_PATCH_CACHE_DIR = '/mnt/data'
     LOCAL_MODEL_OUTPUT_DIR = '/mnt/satellite-resnet2'
     PATCH_SIZE = 224
-    BATCH_SIZE = 256 // world_size  # Divide batch size by number of GPUs
+    BATCH_SIZE = 512  # Divide batch size by number of GPUs
     NUM_EPOCHS = 100
     DEVICE = f'cuda:{rank}'  # Each process uses its own GPU
     torch.cuda.set_device(rank)
@@ -157,7 +157,7 @@ def main_worker(rank, world_size):
     TEST_SPLIT = 0.1
     
     # Configuration for EMA scheduling
-    START_EMA_DECAY = 0.99
+    START_EMA_DECAY = 0.96
     END_EMA_DECAY = 1.0
 
     connection_string = "DefaultEndpointsProtocol=https;AccountName=resnettrainingdata;AccountKey=afq0lgt0sj3lq1+b3Y6eeIg+JArkqE5UJL7tHSeM+Bxa0S3aQSK9ZRMZHozG1PJx2rGfwBh7DySr+ASt3w6JmA==;EndpointSuffix=core.windows.net"
@@ -263,7 +263,7 @@ def main_worker(rank, world_size):
     if rank == 0:
         os.makedirs(LOCAL_MODEL_OUTPUT_DIR, exist_ok=True)
     
-    CHECKPOINT_CONTAINER = "resnet18"
+    CHECKPOINT_CONTAINER = "resnet18-optimized"
     CHECKPOINT_BLOB_NAME = "latest_checkpoint.pth"
     
     if rank == 0:
