@@ -218,8 +218,8 @@ def create_data_yaml(local_data_dir):
 
 def main():
     # --- Configuration ---
-    SOURCE_DATA_CONTAINER = "testsidewalk60"
-    CHECKPOINT_CONTAINER = "testyolosidewalk60"
+    SOURCE_DATA_CONTAINER = "2ktestsidewalk60"
+    CHECKPOINT_CONTAINER = "2ktestyolosidewalk60"
     LOCAL_DATA_DIR = "/mnt/data/yolo_sidewalk"
     NUM_EPOCHS = 300
     BATCH_SIZE = 1024  # Total batch size across all GPUs
@@ -293,18 +293,18 @@ def main():
                         shutil.copy(weights_path, resume_path)
                     else:
                         print("Weights file not found in checkpoint, starting from scratch...")
-                        model = YOLO('yolo11s-seg.pt')
+                        model = YOLO('yolo11x-seg.pt')
                 else:
                     print("Failed to extract checkpoint, starting from scratch...")
-                    model = YOLO('yolo11s-seg.pt')
+                    model = YOLO('yolo11x-seg.pt')
         else:
             print("No checkpoints found, starting from scratch...")
-            model = YOLO('yolo11s-seg.pt')
+            model = YOLO('yolo11x-seg.pt')
     
     except Exception as e:
         print(f"Error checking for checkpoints: {e}")
         print("Starting training from scratch...")
-        model = YOLO('yolo11s-seg.pt')
+        model = YOLO('yolo11x-seg.pt')
     
     # Store connection string and container name for callback
     callback_config = {
