@@ -173,8 +173,10 @@ def main():
     train_transform = T.Compose([
         T.RandomResizedCrop(size=PATCH_SIZE),
         T.RandomHorizontalFlip(p=0.5),
-        T.RandomApply([T.ColorJitter(0.4, 0.4, 0.4, 0.1)], p=0.8),
+        T.RandomApply([T.ColorJitter(0.8, 0.8, 0.8, 0.2)], p=0.8),
         T.RandomGrayscale(p=0.2),
+        T.RandomApply([T.GaussianBlur(23)], p=0.5),
+        T.RandomSolarize(192.0, p=0.2),
         v2_transforms,
         T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     ])
