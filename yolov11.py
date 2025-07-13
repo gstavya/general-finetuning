@@ -928,10 +928,10 @@ def main():
     # --- Configuration ---
     SOURCE_DATA_CONTAINER = "2ktestsidewalk60"
     CHECKPOINT_CONTAINER = "2ktestyolosidewalk60"
-    LOCAL_DATA_DIR = "sidewalk-foundry-data"
-    NUM_EPOCHS = 1
-    BATCH_SIZE = 8  # Total batch size across all GPUs
-    DEVICE = 'cpu'  # Use 4 GPUs
+    LOCAL_DATA_DIR = "/mnt/data/yolo_sidewalk"
+    NUM_EPOCHS = 5
+    BATCH_SIZE = 64  # Total batch size across all GPUs
+    DEVICE = '0,1,2,3'  # Use 4 GPUs
     SAVE_PERIOD = 5
     VISUALIZATION_PORT = 9000
     
