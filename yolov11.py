@@ -481,7 +481,7 @@ def run_visualization_server(metrics_collector, port=5000):
     
     print(f"\n📊 Visualization dashboard running on port {port}")
     print(f"📊 If using ML Foundry, check your job's 'Ports' section to get the public URL")
-    print(f"📊
+    print(f"📊 Otherwise, use SSH port forwarding: ssh -L {port}:localhost:{port} user@host\n")
 
 
 def download_blob(args):
@@ -686,7 +686,7 @@ def main():
     SOURCE_DATA_CONTAINER = "2ktestsidewalk60"
     CHECKPOINT_CONTAINER = "2ktestyolosidewalk60"
     LOCAL_DATA_DIR = "/mnt/data/yolo_sidewalk"
-    NUM_EPOCHS = 10
+    NUM_EPOCHS = 300
     BATCH_SIZE = 64  # Total batch size across all GPUs
     DEVICE = '0,1,2,3'  # Use 4 GPUs
     SAVE_PERIOD = 5
