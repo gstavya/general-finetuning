@@ -11,6 +11,11 @@ import tempfile
 import warnings
 import shutil
 import json
+import time
+from datetime import datetime
+import threading
+from flask import Flask, render_template_string, jsonify
+import logging
 
 # Set YOLO config directory to avoid permission warnings
 os.environ['YOLO_CONFIG_DIR'] = '/tmp/yolo_config'
@@ -18,6 +23,463 @@ os.environ['YOLO_CONFIG_DIR'] = '/tmp/yolo_config'
 # Suppress Ultralytics warnings during multiprocessing
 warnings.filterwarnings('ignore', message='user config directory')
 warnings.filterwarnings('ignore', message='Error decoding JSON')
+
+# Suppress Flask development server warning
+log = logging.getLogger('werkzeug')
+log.setLevel(logging.ERROR)
+
+class MetricsCollector:
+    """Collects and manages training metrics for visualization."""
+    
+    def __init__(self, metrics_file='metrics.json', connection_string=None, container_name=None):
+        self.metrics_file = metrics_file
+        self.connection_string = connection_string
+        self.container_name = container_name
+        self.metrics = {
+            'epochs': [],
+            'train_loss': [],
+            'val_loss': [],
+            'box_precision': [],
+            'box_recall': [],
+            'box_map50': [],
+            'box_map': [],
+            'mask_precision': [],
+            'mask_recall': [],
+            'mask_map50': [],
+            'mask_map': [],
+            'learning_rate': [],
+            'time_per_epoch': [],
+            'timestamps': [],
+            'start_time': datetime.now().isoformat(),
+            'total_epochs': 0,
+            'current_epoch': 0
+        }
+        self.epoch_start_time = None
+        self.load_existing_metrics()
+    
+    def load_existing_metrics(self):
+        """Load existing metrics from file if available."""
+        if os.path.exists(self.metrics_file):
+            try:
+                with open(self.metrics_file, 'r') as f:
+                    self.metrics = json.load(f)
+                print(f"Loaded existing metrics from {self.metrics_file}")
+            except Exception as e:
+                print(f"Could not load existing metrics: {e}")
+    
+    def start_epoch(self):
+        """Mark the start of a new epoch."""
+        self.epoch_start_time = time.time()
+    
+    def add_epoch_metrics(self, epoch, trainer, validation_metrics=None):
+        """Add metrics for the current epoch."""
+        try:
+            # Calculate time for this epoch
+            epoch_time = time.time() - self.epoch_start_time if self.epoch_start_time else 0
+            
+            # Update basic info
+            self.metrics['current_epoch'] = epoch
+            self.metrics['epochs'].append(epoch)
+            self.metrics['time_per_epoch'].append(epoch_time)
+            self.metrics['timestamps'].append(datetime.now().isoformat())
+            
+            # Get training loss (if available)
+            if hasattr(trainer, 'loss'):
+                self.metrics['train_loss'].append(float(trainer.loss))
+            else:
+                self.metrics['train_loss'].append(None)
+            
+            # Get learning rate
+            if hasattr(trainer, 'optimizer') and trainer.optimizer:
+                lr = trainer.optimizer.param_groups[0]['lr']
+                self.metrics['learning_rate'].append(float(lr))
+            else:
+                self.metrics['learning_rate'].append(None)
+            
+            # Add validation metrics if provided
+            if validation_metrics:
+                self.metrics['val_loss'].append(float(validation_metrics.box.fitness) if hasattr(validation_metrics.box, 'fitness') else None)
+                self.metrics['box_precision'].append(float(validation_metrics.box.p.mean()))
+                self.metrics['box_recall'].append(float(validation_metrics.box.r.mean()))
+                self.metrics['box_map50'].append(float(validation_metrics.box.map50))
+                self.metrics['box_map'].append(float(validation_metrics.box.map))
+                self.metrics['mask_precision'].append(float(validation_metrics.seg.p.mean()))
+                self.metrics['mask_recall'].append(float(validation_metrics.seg.r.mean()))
+                self.metrics['mask_map50'].append(float(validation_metrics.seg.map50))
+                self.metrics['mask_map'].append(float(validation_metrics.seg.map))
+            else:
+                # Append None if no validation metrics
+                for key in ['val_loss', 'box_precision', 'box_recall', 'box_map50', 'box_map',
+                           'mask_precision', 'mask_recall', 'mask_map50', 'mask_map']:
+                    self.metrics[key].append(None)
+            
+            # Save to file
+            self.save_metrics()
+            
+        except Exception as e:
+            print(f"Error collecting metrics: {e}")
+    
+    def save_metrics(self):
+        """Save metrics to JSON file and optionally to Azure."""
+        try:
+            with open(self.metrics_file, 'w') as f:
+                json.dump(self.metrics, f, indent=2)
+            
+            # Upload to Azure if configured
+            if self.connection_string and self.container_name:
+                self.upload_metrics_to_azure()
+                
+        except Exception as e:
+            print(f"Error saving metrics: {e}")
+    
+    def upload_metrics_to_azure(self):
+        """Upload metrics JSON to Azure."""
+        try:
+            blob_service_client = BlobServiceClient.from_connection_string(self.connection_string)
+            blob_client = blob_service_client.get_blob_client(
+                container=self.container_name, 
+                blob='training_metrics.json'
+            )
+            
+            with open(self.metrics_file, 'rb') as data:
+                blob_client.upload_blob(data, overwrite=True)
+                
+        except Exception as e:
+            print(f"Failed to upload metrics to Azure: {e}")
+    
+    def set_total_epochs(self, total_epochs):
+        """Set the total number of epochs for training."""
+        self.metrics['total_epochs'] = total_epochs
+
+
+# HTML template for the dashboard
+DASHBOARD_HTML = '''
+<!DOCTYPE html>
+<html>
+<head>
+    <title>YOLO Training Dashboard</title>
+    <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 0;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }
+        h1 {
+            text-align: center;
+            color: #333;
+        }
+        .info-bar {
+            background-color: white;
+            padding: 15px;
+            margin-bottom: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            display: flex;
+            justify-content: space-around;
+            flex-wrap: wrap;
+        }
+        .info-item {
+            text-align: center;
+            margin: 10px;
+        }
+        .info-label {
+            font-size: 12px;
+            color: #666;
+            text-transform: uppercase;
+        }
+        .info-value {
+            font-size: 24px;
+            font-weight: bold;
+            color: #333;
+        }
+        .chart-container {
+            background-color: white;
+            margin-bottom: 20px;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        .chart {
+            width: 100%;
+            height: 400px;
+        }
+        .grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(600px, 1fr));
+            gap: 20px;
+        }
+        .status {
+            position: fixed;
+            top: 10px;
+            right: 10px;
+            padding: 5px 10px;
+            border-radius: 5px;
+            font-size: 12px;
+        }
+        .status.connected {
+            background-color: #4CAF50;
+            color: white;
+        }
+        .status.disconnected {
+            background-color: #f44336;
+            color: white;
+        }
+    </style>
+</head>
+<body>
+    <div class="status connected" id="status">Connected</div>
+    <h1>YOLO Training Dashboard</h1>
+    
+    <div class="info-bar" id="info-bar">
+        <div class="info-item">
+            <div class="info-label">Current Epoch</div>
+            <div class="info-value" id="current-epoch">-</div>
+        </div>
+        <div class="info-item">
+            <div class="info-label">Total Epochs</div>
+            <div class="info-value" id="total-epochs">-</div>
+        </div>
+        <div class="info-item">
+            <div class="info-label">Best mAP50-95</div>
+            <div class="info-value" id="best-map">-</div>
+        </div>
+        <div class="info-item">
+            <div class="info-label">Time per Epoch</div>
+            <div class="info-value" id="time-per-epoch">-</div>
+        </div>
+        <div class="info-item">
+            <div class="info-label">ETA</div>
+            <div class="info-value" id="eta">-</div>
+        </div>
+    </div>
+    
+    <div class="grid">
+        <div class="chart-container">
+            <div id="loss-chart" class="chart"></div>
+        </div>
+        <div class="chart-container">
+            <div id="map-chart" class="chart"></div>
+        </div>
+        <div class="chart-container">
+            <div id="precision-recall-chart" class="chart"></div>
+        </div>
+        <div class="chart-container">
+            <div id="learning-rate-chart" class="chart"></div>
+        </div>
+    </div>
+    
+    <script>
+        let lastUpdate = null;
+        
+        function updateDashboard() {
+            fetch('/metrics')
+                .then(response => response.json())
+                .then(data => {
+                    // Update info bar
+                    document.getElementById('current-epoch').textContent = data.current_epoch || '-';
+                    document.getElementById('total-epochs').textContent = data.total_epochs || '-';
+                    
+                    // Calculate best mAP
+                    const boxMaps = data.box_map.filter(v => v !== null);
+                    const bestMap = boxMaps.length > 0 ? Math.max(...boxMaps).toFixed(4) : '-';
+                    document.getElementById('best-map').textContent = bestMap;
+                    
+                    // Calculate average time per epoch
+                    const times = data.time_per_epoch.filter(v => v !== null);
+                    const avgTime = times.length > 0 ? (times.reduce((a, b) => a + b, 0) / times.length).toFixed(1) : '-';
+                    document.getElementById('time-per-epoch').textContent = avgTime + 's';
+                    
+                    // Calculate ETA
+                    if (data.current_epoch && data.total_epochs && avgTime !== '-') {
+                        const remainingEpochs = data.total_epochs - data.current_epoch;
+                        const etaSeconds = remainingEpochs * parseFloat(avgTime);
+                        const etaHours = Math.floor(etaSeconds / 3600);
+                        const etaMinutes = Math.floor((etaSeconds % 3600) / 60);
+                        document.getElementById('eta').textContent = `${etaHours}h ${etaMinutes}m`;
+                    } else {
+                        document.getElementById('eta').textContent = '-';
+                    }
+                    
+                    // Update charts
+                    updateCharts(data);
+                    
+                    // Update status
+                    document.getElementById('status').className = 'status connected';
+                    document.getElementById('status').textContent = 'Connected';
+                    lastUpdate = Date.now();
+                })
+                .catch(error => {
+                    console.error('Error fetching metrics:', error);
+                    document.getElementById('status').className = 'status disconnected';
+                    document.getElementById('status').textContent = 'Disconnected';
+                });
+        }
+        
+        function updateCharts(data) {
+            // Loss Chart
+            const lossTraces = [
+                {
+                    x: data.epochs,
+                    y: data.train_loss,
+                    name: 'Train Loss',
+                    type: 'scatter',
+                    mode: 'lines+markers'
+                }
+            ];
+            
+            if (data.val_loss.some(v => v !== null)) {
+                lossTraces.push({
+                    x: data.epochs,
+                    y: data.val_loss,
+                    name: 'Val Loss',
+                    type: 'scatter',
+                    mode: 'lines+markers'
+                });
+            }
+            
+            Plotly.newPlot('loss-chart', lossTraces, {
+                title: 'Training and Validation Loss',
+                xaxis: { title: 'Epoch' },
+                yaxis: { title: 'Loss' }
+            });
+            
+            // mAP Chart
+            const mapTraces = [
+                {
+                    x: data.epochs,
+                    y: data.box_map50,
+                    name: 'Box mAP50',
+                    type: 'scatter',
+                    mode: 'lines+markers'
+                },
+                {
+                    x: data.epochs,
+                    y: data.box_map,
+                    name: 'Box mAP50-95',
+                    type: 'scatter',
+                    mode: 'lines+markers'
+                },
+                {
+                    x: data.epochs,
+                    y: data.mask_map50,
+                    name: 'Mask mAP50',
+                    type: 'scatter',
+                    mode: 'lines+markers',
+                    line: { dash: 'dash' }
+                },
+                {
+                    x: data.epochs,
+                    y: data.mask_map,
+                    name: 'Mask mAP50-95',
+                    type: 'scatter',
+                    mode: 'lines+markers',
+                    line: { dash: 'dash' }
+                }
+            ];
+            
+            Plotly.newPlot('map-chart', mapTraces, {
+                title: 'Mean Average Precision (mAP)',
+                xaxis: { title: 'Epoch' },
+                yaxis: { title: 'mAP', range: [0, 1] }
+            });
+            
+            // Precision-Recall Chart
+            const prTraces = [
+                {
+                    x: data.epochs,
+                    y: data.box_precision,
+                    name: 'Box Precision',
+                    type: 'scatter',
+                    mode: 'lines+markers'
+                },
+                {
+                    x: data.epochs,
+                    y: data.box_recall,
+                    name: 'Box Recall',
+                    type: 'scatter',
+                    mode: 'lines+markers'
+                },
+                {
+                    x: data.epochs,
+                    y: data.mask_precision,
+                    name: 'Mask Precision',
+                    type: 'scatter',
+                    mode: 'lines+markers',
+                    line: { dash: 'dash' }
+                },
+                {
+                    x: data.epochs,
+                    y: data.mask_recall,
+                    name: 'Mask Recall',
+                    type: 'scatter',
+                    mode: 'lines+markers',
+                    line: { dash: 'dash' }
+                }
+            ];
+            
+            Plotly.newPlot('precision-recall-chart', prTraces, {
+                title: 'Precision and Recall',
+                xaxis: { title: 'Epoch' },
+                yaxis: { title: 'Score', range: [0, 1] }
+            });
+            
+            // Learning Rate Chart
+            const lrTrace = [{
+                x: data.epochs,
+                y: data.learning_rate,
+                name: 'Learning Rate',
+                type: 'scatter',
+                mode: 'lines+markers'
+            }];
+            
+            Plotly.newPlot('learning-rate-chart', lrTrace, {
+                title: 'Learning Rate Schedule',
+                xaxis: { title: 'Epoch' },
+                yaxis: { title: 'Learning Rate', type: 'log' }
+            });
+        }
+        
+        // Initial update
+        updateDashboard();
+        
+        // Update every 5 seconds
+        setInterval(updateDashboard, 5000);
+        
+        // Check connection status
+        setInterval(() => {
+            if (lastUpdate && Date.now() - lastUpdate > 15000) {
+                document.getElementById('status').className = 'status disconnected';
+                document.getElementById('status').textContent = 'Disconnected';
+            }
+        }, 1000);
+    </script>
+</body>
+</html>
+'''
+
+
+def run_visualization_server(metrics_collector, port=5000):
+    """Run the Flask visualization server."""
+    app = Flask(__name__)
+    
+    @app.route('/')
+    def dashboard():
+        return render_template_string(DASHBOARD_HTML)
+    
+    @app.route('/metrics')
+    def get_metrics():
+        return jsonify(metrics_collector.metrics)
+    
+    # Run in a separate thread
+    def run_server():
+        app.run(host='0.0.0.0', port=port, debug=False, threaded=True)
+    
+    server_thread = threading.Thread(target=run_server, daemon=True)
+    server_thread.start()
+    print(f"\n📊 Visualization dashboard running at http://localhost:{port}\n")
+
 
 def download_blob(args):
     """Worker function to download a single blob."""
@@ -225,6 +687,7 @@ def main():
     BATCH_SIZE = 64  # Total batch size across all GPUs
     DEVICE = '0,1,2,3'  # Use 4 GPUs
     SAVE_PERIOD = 5
+    VISUALIZATION_PORT = 5000
     
     # Create YOLO config directory
     os.makedirs('/tmp/yolo_config', exist_ok=True)
@@ -234,6 +697,16 @@ def main():
     
     print(f"Using devices: {DEVICE}")
     print(f"Total batch size: {BATCH_SIZE} (will be split across 4 GPUs)")
+    
+    # Initialize metrics collector
+    metrics_collector = MetricsCollector(
+        metrics_file='training_metrics.json',
+        connection_string=connection_string,
+        container_name=CHECKPOINT_CONTAINER
+    )
+    
+    # Start visualization server
+    run_visualization_server(metrics_collector, port=VISUALIZATION_PORT)
     
     # Download data from Azure
     download_from_azure(
@@ -306,6 +779,9 @@ def main():
         print("Starting training from scratch...")
         model = YOLO('yolo11x-seg.pt')
     
+    # Set total epochs in metrics collector
+    metrics_collector.set_total_epochs(NUM_EPOCHS)
+    
     # Store connection string and container name for callback
     callback_config = {
         'connection_string': connection_string,
@@ -313,12 +789,16 @@ def main():
         'save_period': SAVE_PERIOD,
         'data_yaml': data_yaml_path,
         'start_epoch': start_epoch,
-        'epoch_counter': 0  # Track epochs manually
+        'epoch_counter': 0,  # Track epochs manually
+        'metrics_collector': metrics_collector
     }
     
     # Custom training callback to save complete checkpoints
     def on_train_epoch_end(trainer):
         """Callback to save complete checkpoint and display metrics."""
+        # Start timing for next epoch
+        callback_config['metrics_collector'].start_epoch()
+        
         # Increment epoch counter
         callback_config['epoch_counter'] += 1
         
@@ -344,9 +824,15 @@ def main():
             print(f"  mAP50: {metrics.seg.map50:.4f}")
             print(f"  mAP50-95: {metrics.seg.map:.4f}")
             print("------------------------------------\n")
+            
+            # Add metrics to collector
+            callback_config['metrics_collector'].add_epoch_metrics(actual_epoch, trainer, metrics)
+            
         except Exception as e:
             print(f"Error calculating validation metrics: {e}")
             print("------------------------------------\n")
+            # Still add metrics even if validation fails
+            callback_config['metrics_collector'].add_epoch_metrics(actual_epoch, trainer, None)
         
         # Save checkpoint every SAVE_PERIOD epochs
         if actual_epoch % callback_config['save_period'] == 0:
@@ -376,7 +862,13 @@ def main():
                 actual_epoch
             )
     
+    # Callback to start epoch timer
+    def on_train_epoch_start(trainer):
+        """Callback to start timing the epoch."""
+        callback_config['metrics_collector'].start_epoch()
+    
     # Add callbacks to model
+    model.add_callback("on_train_epoch_start", on_train_epoch_start)
     model.add_callback("on_train_epoch_end", on_train_epoch_end)
     # Try both hooks to ensure we catch the epoch end
     model.add_callback("on_epoch_end", on_train_epoch_end_alt)
@@ -448,7 +940,7 @@ def main():
         print("\nSaving final model to Azure...")
         
         # Save as both final model and final checkpoint
-        final_blob_name = "yolov11s_seg_sidewalk_final.pt"
+        final_blob_name = "yolov11x_seg_sidewalk_final.pt"
         best_model_path = os.path.join(temp_project_dir, 'yolov11x_seg_sidewalk', 'weights', 'best.pt')
         
         if os.path.exists(best_model_path):
@@ -481,12 +973,17 @@ def main():
         metrics = model.val()
         print(f"Box mAP50-95: {metrics.box.map}")
         print(f"Mask mAP50-95: {metrics.seg.map}")
+        
+        # Save final metrics
+        metrics_collector.save_metrics()
     
     # Clean up resume weights if exists
     if resume_path and os.path.exists(resume_path):
         os.remove(resume_path)
     
     print("\n✅ Training complete!")
+    print(f"📊 Metrics saved to: training_metrics.json")
+    print(f"📊 Dashboard was available at: http://localhost:{VISUALIZATION_PORT}")
 
 if __name__ == '__main__':
     # Set multiprocessing start method
