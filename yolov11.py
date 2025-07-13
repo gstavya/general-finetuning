@@ -70,6 +70,31 @@ class MetricsCollector:
     def start_epoch(self):
         """Mark the start of a new epoch."""
         self.epoch_start_time = time.time()
+
+    def add_batch_metrics(self, trainer):
+        """Add metrics for the current training batch."""
+        try:
+            if hasattr(trainer, 'loss'):
+                # This is a simplified example; you might need to adjust how you
+                # access the loss for the current batch.
+                current_loss = float(trainer.loss.item())
+                self.metrics['train_loss'].append(current_loss)
+    
+            if hasattr(trainer, 'optimizer') and trainer.optimizer:
+                lr = trainer.optimizer.param_groups[0]['lr']
+                self.metrics['learning_rate'].append(float(lr))
+    
+            # You can add a 'steps' or 'iterations' array to your metrics
+            # to use as the x-axis for more granular plots.
+            if 'steps' not in self.metrics:
+                self.metrics['steps'] = []
+            self.metrics['steps'].append(len(self.metrics['train_loss']))
+    
+            # Save metrics after each batch update
+            self.save_metrics()
+    
+        except Exception as e:
+            print(f"Error collecting batch metrics: {e}")
     
     def add_epoch_metrics(self, epoch, trainer, validation_metrics=None):
         """Add metrics for the current epoch."""
@@ -845,6 +870,9 @@ def main():
             )
         else:
             print(f"ℹ️  Epoch {actual_epoch} - Not saving (next save at epoch {((actual_epoch // callback_config['save_period']) + 1) * callback_config['save_period']})")
+    def on_train_batch_end(trainer):
+        """Callback to collect and save metrics at the end of each batch."""
+        callback_config['metrics_collector'].add_batch_metrics(trainer)
     
     # Also add a callback that runs after each epoch completes (alternative hook)
     def on_train_epoch_end_alt(trainer):
@@ -872,6 +900,7 @@ def main():
     model.add_callback("on_train_epoch_end", on_train_epoch_end)
     # Try both hooks to ensure we catch the epoch end
     model.add_callback("on_epoch_end", on_train_epoch_end_alt)
+    model.add_callback("on_train_batch_end", on_train_batch_end)
     
     # Use temporary directory for YOLO's internal outputs
     with tempfile.TemporaryDirectory() as temp_project_dir:
