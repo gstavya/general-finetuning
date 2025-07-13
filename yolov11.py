@@ -449,7 +449,7 @@ def main():
         
         # Save as both final model and final checkpoint
         final_blob_name = "yolov11s_seg_sidewalk_final.pt"
-        best_model_path = os.path.join(temp_project_dir, 'yolov11s_seg_sidewalk', 'weights', 'best.pt')
+        best_model_path = os.path.join(temp_project_dir, 'yolov11x_seg_sidewalk', 'weights', 'best.pt')
         
         if os.path.exists(best_model_path):
             try:
