@@ -478,7 +478,10 @@ def run_visualization_server(metrics_collector, port=5000):
     
     server_thread = threading.Thread(target=run_server, daemon=True)
     server_thread.start()
-    print(f"\n📊 Visualization dashboard running at http://localhost:{port}\n")
+    
+    print(f"\n📊 Visualization dashboard running on port {port}")
+    print(f"📊 If using ML Foundry, check your job's 'Ports' section to get the public URL")
+    print(f"📊
 
 
 def download_blob(args):
@@ -681,9 +684,9 @@ def create_data_yaml(local_data_dir):
 def main():
     # --- Configuration ---
     SOURCE_DATA_CONTAINER = "2ktestsidewalk60"
-    CHECKPOINT_CONTAINER = "quicktestyolo"
+    CHECKPOINT_CONTAINER = "2ktestyolosidewalk60"
     LOCAL_DATA_DIR = "/mnt/data/yolo_sidewalk"
-    NUM_EPOCHS = 50
+    NUM_EPOCHS = 300
     BATCH_SIZE = 64  # Total batch size across all GPUs
     DEVICE = '0,1,2,3'  # Use 4 GPUs
     SAVE_PERIOD = 5
@@ -796,9 +799,6 @@ def main():
     # Custom training callback to save complete checkpoints
     def on_train_epoch_end(trainer):
         """Callback to save complete checkpoint and display metrics."""
-        # Start timing for next epoch
-        callback_config['metrics_collector'].start_epoch()
-        
         # Increment epoch counter
         callback_config['epoch_counter'] += 1
         
@@ -885,6 +885,9 @@ def main():
         # Train the model
         print(f"\nStarting training from epoch {start_epoch + 1} to {NUM_EPOCHS}...")
         print(f"Training for {remaining_epochs} more epochs...")
+        
+        # Start timing for the first epoch
+        callback_config['metrics_collector'].start_epoch()
         
         # Prepare training arguments
         train_args = {
