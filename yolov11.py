@@ -74,25 +74,47 @@ class MetricsCollector:
     def add_batch_metrics(self, trainer):
         """Add metrics for the current training batch."""
         try:
+            # Collect total loss
             if hasattr(trainer, 'loss'):
-                # This is a simplified example; you might need to adjust how you
-                # access the loss for the current batch.
                 current_loss = float(trainer.loss.item())
                 self.metrics['train_loss'].append(current_loss)
-    
+            
+            # Initialize component loss arrays if they don't exist
+            if 'box_loss' not in self.metrics:
+                self.metrics['box_loss'] = []
+                self.metrics['seg_loss'] = []
+                self.metrics['cls_loss'] = []
+                self.metrics['dfl_loss'] = []
+            
+            # Collect component losses
+            if hasattr(trainer, 'loss_items'):
+                # loss_items typically contains [box_loss, cls_loss, dfl_loss] for detection
+                # or [box_loss, seg_loss, cls_loss, dfl_loss] for segmentation
+                loss_items = trainer.loss_items
+                if len(loss_items) >= 3:
+                    self.metrics['box_loss'].append(float(loss_items[0]))
+                    if len(loss_items) == 4:  # Segmentation model
+                        self.metrics['seg_loss'].append(float(loss_items[1]))
+                        self.metrics['cls_loss'].append(float(loss_items[2]))
+                        self.metrics['dfl_loss'].append(float(loss_items[3]))
+                    else:  # Detection model
+                        self.metrics['cls_loss'].append(float(loss_items[1]))
+                        self.metrics['dfl_loss'].append(float(loss_items[2]))
+                        self.metrics['seg_loss'].append(0.0)  # No seg loss for detection
+            
+            # Collect learning rate
             if hasattr(trainer, 'optimizer') and trainer.optimizer:
                 lr = trainer.optimizer.param_groups[0]['lr']
                 self.metrics['learning_rate'].append(float(lr))
-    
-            # You can add a 'steps' or 'iterations' array to your metrics
-            # to use as the x-axis for more granular plots.
+            
+            # Track steps
             if 'steps' not in self.metrics:
                 self.metrics['steps'] = []
             self.metrics['steps'].append(len(self.metrics['train_loss']))
-    
+            
             # Save metrics after each batch update
             self.save_metrics()
-    
+            
         except Exception as e:
             print(f"Error collecting batch metrics: {e}")
     
@@ -176,14 +198,12 @@ class MetricsCollector:
         """Set the total number of epochs for training."""
         self.metrics['total_epochs'] = total_epochs
 
-
-# HTML template for the dashboard
 DASHBOARD_HTML = '''
 <!DOCTYPE html>
 <html>
 <head>
     <title>YOLO Training Dashboard</title>
-    <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
+    <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
     <style>
         body {
             font-family: Arial, sans-serif;
@@ -263,35 +283,45 @@ DASHBOARD_HTML = '''
             <div class="info-value" id="current-epoch">-</div>
         </div>
         <div class="info-item">
-            <div class="info-label">Total Epochs</div>
-            <div class="info-value" id="total-epochs">-</div>
+            <div class="info-label">Total Steps</div>
+            <div class="info-value" id="total-steps">-</div>
         </div>
         <div class="info-item">
-            <div class="info-label">Best mAP50-95</div>
-            <div class="info-value" id="best-map">-</div>
+            <div class="info-label">Train Loss</div>
+            <div class="info-value" id="current-loss">-</div>
         </div>
         <div class="info-item">
-            <div class="info-label">Time per Epoch</div>
-            <div class="info-value" id="time-per-epoch">-</div>
+            <div class="info-label">Val Loss</div>
+            <div class="info-value" id="val-loss">-</div>
         </div>
         <div class="info-item">
-            <div class="info-label">ETA</div>
-            <div class="info-value" id="eta">-</div>
+            <div class="info-label">Box Loss</div>
+            <div class="info-value" id="box-loss">-</div>
+        </div>
+        <div class="info-item">
+            <div class="info-label">Seg Loss</div>
+            <div class="info-value" id="seg-loss">-</div>
         </div>
     </div>
     
     <div class="grid">
         <div class="chart-container">
-            <div id="loss-chart" class="chart"></div>
+            <div id="batch-loss-chart" class="chart"></div>
         </div>
         <div class="chart-container">
-            <div id="map-chart" class="chart"></div>
+            <div id="train-val-loss-chart" class="chart"></div>
+        </div>
+        <div class="chart-container">
+            <div id="component-loss-chart" class="chart"></div>
+        </div>
+        <div class="chart-container">
+            <div id="map-scores-chart" class="chart"></div>
+        </div>
+        <div class="chart-container">
+            <div id="lr-chart" class="chart"></div>
         </div>
         <div class="chart-container">
             <div id="precision-recall-chart" class="chart"></div>
-        </div>
-        <div class="chart-container">
-            <div id="learning-rate-chart" class="chart"></div>
         </div>
     </div>
     
@@ -303,28 +333,37 @@ DASHBOARD_HTML = '''
                 .then(response => response.json())
                 .then(data => {
                     // Update info bar
-                    document.getElementById('current-epoch').textContent = data.current_epoch || '-';
-                    document.getElementById('total-epochs').textContent = data.total_epochs || '-';
+                    document.getElementById('current-epoch').textContent = data.current_epoch || '0';
                     
-                    // Calculate best mAP
-                    const boxMaps = data.box_map.filter(v => v !== null);
-                    const bestMap = boxMaps.length > 0 ? Math.max(...boxMaps).toFixed(4) : '-';
-                    document.getElementById('best-map').textContent = bestMap;
+                    // Update step count
+                    const totalSteps = data.steps ? data.steps.length : 0;
+                    document.getElementById('total-steps').textContent = totalSteps;
                     
-                    // Calculate average time per epoch
-                    const times = data.time_per_epoch.filter(v => v !== null);
-                    const avgTime = times.length > 0 ? (times.reduce((a, b) => a + b, 0) / times.length).toFixed(1) : '-';
-                    document.getElementById('time-per-epoch').textContent = avgTime + 's';
+                    // Current losses (last values)
+                    if (data.train_loss && data.train_loss.length > 0) {
+                        const currentLoss = data.train_loss[data.train_loss.length - 1];
+                        document.getElementById('current-loss').textContent = currentLoss.toFixed(3);
+                    }
                     
-                    // Calculate ETA
-                    if (data.current_epoch && data.total_epochs && avgTime !== '-') {
-                        const remainingEpochs = data.total_epochs - data.current_epoch;
-                        const etaSeconds = remainingEpochs * parseFloat(avgTime);
-                        const etaHours = Math.floor(etaSeconds / 3600);
-                        const etaMinutes = Math.floor((etaSeconds % 3600) / 60);
-                        document.getElementById('eta').textContent = `${etaHours}h ${etaMinutes}m`;
+                    // Validation loss (last epoch value)
+                    if (data.val_loss && data.val_loss.length > 0) {
+                        const valLosses = data.val_loss.filter(v => v !== null);
+                        if (valLosses.length > 0) {
+                            const lastValLoss = valLosses[valLosses.length - 1];
+                            document.getElementById('val-loss').textContent = lastValLoss.toFixed(3);
+                        }
                     } else {
-                        document.getElementById('eta').textContent = '-';
+                        document.getElementById('val-loss').textContent = 'N/A';
+                    }
+                    
+                    if (data.box_loss && data.box_loss.length > 0) {
+                        const boxLoss = data.box_loss[data.box_loss.length - 1];
+                        document.getElementById('box-loss').textContent = boxLoss.toFixed(3);
+                    }
+                    
+                    if (data.seg_loss && data.seg_loss.length > 0) {
+                        const segLoss = data.seg_loss[data.seg_loss.length - 1];
+                        document.getElementById('seg-loss').textContent = segLoss.toFixed(3);
                     }
                     
                     // Update charts
@@ -343,138 +382,310 @@ DASHBOARD_HTML = '''
         }
         
         function updateCharts(data) {
-            // Loss Chart
-            const lossTraces = [
-                {
-                    x: data.epochs,
+            // Batch-level Training Loss Chart
+            if (data.steps && data.train_loss && data.train_loss.length > 0) {
+                const traces = [{
+                    x: data.steps,
                     y: data.train_loss,
-                    name: 'Train Loss',
                     type: 'scatter',
-                    mode: 'lines+markers'
+                    mode: 'lines',
+                    name: 'Training Loss',
+                    line: { color: 'blue', width: 1 }
+                }];
+                
+                // Add moving average
+                const windowSize = 20;
+                if (data.train_loss.length > windowSize) {
+                    const movingAvg = [];
+                    for (let i = windowSize - 1; i < data.train_loss.length; i++) {
+                        const window = data.train_loss.slice(i - windowSize + 1, i + 1);
+                        const avg = window.reduce((a, b) => a + b) / window.length;
+                        movingAvg.push(avg);
+                    }
+                    
+                    traces.push({
+                        x: data.steps.slice(windowSize - 1),
+                        y: movingAvg,
+                        type: 'scatter',
+                        mode: 'lines',
+                        name: 'Moving Avg (20)',
+                        line: { color: 'red', width: 2, dash: 'dash' }
+                    });
                 }
-            ];
-            
-            if (data.val_loss.some(v => v !== null)) {
-                lossTraces.push({
-                    x: data.epochs,
-                    y: data.val_loss,
-                    name: 'Val Loss',
-                    type: 'scatter',
-                    mode: 'lines+markers'
+                
+                Plotly.newPlot('batch-loss-chart', traces, {
+                    title: 'Training Loss (Batch Level)',
+                    xaxis: { title: 'Training Step' },
+                    yaxis: { title: 'Loss' },
+                    showlegend: true
                 });
             }
             
-            Plotly.newPlot('loss-chart', lossTraces, {
-                title: 'Training and Validation Loss',
-                xaxis: { title: 'Epoch' },
-                yaxis: { title: 'Loss' }
-            });
-            
-            // mAP Chart
-            const mapTraces = [
-                {
-                    x: data.epochs,
-                    y: data.box_map50,
-                    name: 'Box mAP50',
-                    type: 'scatter',
-                    mode: 'lines+markers'
-                },
-                {
-                    x: data.epochs,
-                    y: data.box_map,
-                    name: 'Box mAP50-95',
-                    type: 'scatter',
-                    mode: 'lines+markers'
-                },
-                {
-                    x: data.epochs,
-                    y: data.mask_map50,
-                    name: 'Mask mAP50',
-                    type: 'scatter',
-                    mode: 'lines+markers',
-                    line: { dash: 'dash' }
-                },
-                {
-                    x: data.epochs,
-                    y: data.mask_map,
-                    name: 'Mask mAP50-95',
-                    type: 'scatter',
-                    mode: 'lines+markers',
-                    line: { dash: 'dash' }
+            // Train vs Validation Loss (Epoch Level)
+            if (data.epochs && data.epochs.length > 0) {
+                const traces = [];
+                
+                // For epoch-level train loss, we need to get the loss at the end of each epoch
+                // This is stored in the epochs array positions
+                if (data.train_loss && data.epochs.length <= data.train_loss.length) {
+                    traces.push({
+                        x: data.epochs,
+                        y: data.epochs.map((epoch, idx) => {
+                            // Get the average loss for that epoch or last value
+                            return data.train_loss[Math.min(idx, data.train_loss.length - 1)];
+                        }),
+                        type: 'scatter',
+                        mode: 'lines+markers',
+                        name: 'Training Loss',
+                        line: { color: 'blue', width: 2 },
+                        marker: { size: 8 }
+                    });
                 }
-            ];
-            
-            Plotly.newPlot('map-chart', mapTraces, {
-                title: 'Mean Average Precision (mAP)',
-                xaxis: { title: 'Epoch' },
-                yaxis: { title: 'mAP', range: [0, 1] }
-            });
-            
-            // Precision-Recall Chart
-            const prTraces = [
-                {
-                    x: data.epochs,
-                    y: data.box_precision,
-                    name: 'Box Precision',
-                    type: 'scatter',
-                    mode: 'lines+markers'
-                },
-                {
-                    x: data.epochs,
-                    y: data.box_recall,
-                    name: 'Box Recall',
-                    type: 'scatter',
-                    mode: 'lines+markers'
-                },
-                {
-                    x: data.epochs,
-                    y: data.mask_precision,
-                    name: 'Mask Precision',
-                    type: 'scatter',
-                    mode: 'lines+markers',
-                    line: { dash: 'dash' }
-                },
-                {
-                    x: data.epochs,
-                    y: data.mask_recall,
-                    name: 'Mask Recall',
-                    type: 'scatter',
-                    mode: 'lines+markers',
-                    line: { dash: 'dash' }
+                
+                if (data.val_loss && data.val_loss.some(v => v !== null)) {
+                    traces.push({
+                        x: data.epochs,
+                        y: data.val_loss,
+                        type: 'scatter',
+                        mode: 'lines+markers',
+                        name: 'Validation Loss',
+                        line: { color: 'orange', width: 2 },
+                        marker: { size: 8 }
+                    });
                 }
-            ];
+                
+                if (traces.length > 0) {
+                    Plotly.newPlot('train-val-loss-chart', traces, {
+                        title: 'Training vs Validation Loss (Per Epoch)',
+                        xaxis: { title: 'Epoch' },
+                        yaxis: { title: 'Loss' },
+                        showlegend: true
+                    });
+                } else {
+                    Plotly.newPlot('train-val-loss-chart', [], {
+                        title: 'Training vs Validation Loss (Waiting for epoch completion)',
+                        xaxis: { title: 'Epoch' },
+                        yaxis: { title: 'Loss' },
+                        annotations: [{
+                            text: 'Validation loss appears after each epoch completes',
+                            xref: 'paper',
+                            yref: 'paper',
+                            x: 0.5,
+                            y: 0.5,
+                            showarrow: false,
+                            font: { size: 14, color: 'gray' }
+                        }]
+                    });
+                }
+            } else {
+                Plotly.newPlot('train-val-loss-chart', [], {
+                    title: 'Training vs Validation Loss (Waiting for epoch completion)',
+                    xaxis: { title: 'Epoch' },
+                    yaxis: { title: 'Loss' }
+                });
+            }
             
-            Plotly.newPlot('precision-recall-chart', prTraces, {
-                title: 'Precision and Recall',
-                xaxis: { title: 'Epoch' },
-                yaxis: { title: 'Score', range: [0, 1] }
-            });
+            // Component Losses Chart
+            if (data.steps && data.box_loss && data.box_loss.length > 0) {
+                const traces = [];
+                
+                if (data.box_loss) {
+                    traces.push({
+                        x: data.steps,
+                        y: data.box_loss,
+                        type: 'scatter',
+                        mode: 'lines',
+                        name: 'Box Loss',
+                        line: { color: 'green', width: 2 }
+                    });
+                }
+                
+                if (data.seg_loss && data.seg_loss.some(v => v > 0)) {
+                    traces.push({
+                        x: data.steps,
+                        y: data.seg_loss,
+                        type: 'scatter',
+                        mode: 'lines',
+                        name: 'Segmentation Loss',
+                        line: { color: 'purple', width: 2 }
+                    });
+                }
+                
+                if (data.cls_loss) {
+                    traces.push({
+                        x: data.steps,
+                        y: data.cls_loss,
+                        type: 'scatter',
+                        mode: 'lines',
+                        name: 'Classification Loss',
+                        line: { color: 'orange', width: 2 }
+                    });
+                }
+                
+                if (data.dfl_loss) {
+                    traces.push({
+                        x: data.steps,
+                        y: data.dfl_loss,
+                        type: 'scatter',
+                        mode: 'lines',
+                        name: 'DFL Loss',
+                        line: { color: 'brown', width: 2 }
+                    });
+                }
+                
+                Plotly.newPlot('component-loss-chart', traces, {
+                    title: 'Component Losses',
+                    xaxis: { title: 'Training Step' },
+                    yaxis: { title: 'Loss' },
+                    showlegend: true
+                });
+            }
+            
+            // mAP Scores Chart
+            if (data.epochs && data.epochs.length > 0 && data.box_map && data.box_map.length > 0) {
+                const traces = [];
+                
+                if (data.box_map50) {
+                    traces.push({
+                        x: data.epochs,
+                        y: data.box_map50,
+                        name: 'Box mAP50',
+                        type: 'scatter',
+                        mode: 'lines+markers',
+                        line: { color: 'blue', width: 2 }
+                    });
+                }
+                
+                if (data.box_map) {
+                    traces.push({
+                        x: data.epochs,
+                        y: data.box_map,
+                        name: 'Box mAP50-95',
+                        type: 'scatter',
+                        mode: 'lines+markers',
+                        line: { color: 'darkblue', width: 2 }
+                    });
+                }
+                
+                if (data.mask_map50) {
+                    traces.push({
+                        x: data.epochs,
+                        y: data.mask_map50,
+                        name: 'Mask mAP50',
+                        type: 'scatter',
+                        mode: 'lines+markers',
+                        line: { color: 'green', width: 2, dash: 'dash' }
+                    });
+                }
+                
+                if (data.mask_map) {
+                    traces.push({
+                        x: data.epochs,
+                        y: data.mask_map,
+                        name: 'Mask mAP50-95',
+                        type: 'scatter',
+                        mode: 'lines+markers',
+                        line: { color: 'darkgreen', width: 2, dash: 'dash' }
+                    });
+                }
+                
+                Plotly.newPlot('map-scores-chart', traces, {
+                    title: 'Mean Average Precision (mAP)',
+                    xaxis: { title: 'Epoch' },
+                    yaxis: { title: 'mAP', range: [0, 1] },
+                    showlegend: true
+                });
+            } else {
+                Plotly.newPlot('map-scores-chart', [], {
+                    title: 'mAP Scores (Available after epoch completes)',
+                    xaxis: { title: 'Epoch' },
+                    yaxis: { title: 'mAP', range: [0, 1] }
+                });
+            }
             
             // Learning Rate Chart
-            const lrTrace = [{
-                x: data.epochs,
-                y: data.learning_rate,
-                name: 'Learning Rate',
-                type: 'scatter',
-                mode: 'lines+markers'
-            }];
+            if (data.steps && data.learning_rate && data.learning_rate.length > 0) {
+                const lrTrace = [{
+                    x: data.steps,
+                    y: data.learning_rate,
+                    type: 'scatter',
+                    mode: 'lines',
+                    name: 'Learning Rate',
+                    line: { color: 'teal', width: 2 }
+                }];
+                
+                Plotly.newPlot('lr-chart', lrTrace, {
+                    title: 'Learning Rate Schedule',
+                    xaxis: { title: 'Training Step' },
+                    yaxis: { 
+                        title: 'Learning Rate',
+                        type: 'log',
+                        exponentformat: 'e'
+                    }
+                });
+            }
             
-            Plotly.newPlot('learning-rate-chart', lrTrace, {
-                title: 'Learning Rate Schedule',
-                xaxis: { title: 'Epoch' },
-                yaxis: { title: 'Learning Rate', type: 'log' }
-            });
+            // Precision-Recall Chart
+            if (data.epochs && data.epochs.length > 0 && data.box_precision && data.box_precision.length > 0) {
+                const traces = [
+                    {
+                        x: data.epochs,
+                        y: data.box_precision,
+                        name: 'Box Precision',
+                        type: 'scatter',
+                        mode: 'lines+markers',
+                        line: { color: 'red', width: 2 }
+                    },
+                    {
+                        x: data.epochs,
+                        y: data.box_recall,
+                        name: 'Box Recall',
+                        type: 'scatter',
+                        mode: 'lines+markers',
+                        line: { color: 'blue', width: 2 }
+                    },
+                    {
+                        x: data.epochs,
+                        y: data.mask_precision,
+                        name: 'Mask Precision',
+                        type: 'scatter',
+                        mode: 'lines+markers',
+                        line: { color: 'red', width: 2, dash: 'dash' }
+                    },
+                    {
+                        x: data.epochs,
+                        y: data.mask_recall,
+                        name: 'Mask Recall',
+                        type: 'scatter',
+                        mode: 'lines+markers',
+                        line: { color: 'blue', width: 2, dash: 'dash' }
+                    }
+                ];
+                
+                Plotly.newPlot('precision-recall-chart', traces, {
+                    title: 'Precision and Recall',
+                    xaxis: { title: 'Epoch' },
+                    yaxis: { title: 'Score', range: [0, 1] },
+                    showlegend: true
+                });
+            } else {
+                Plotly.newPlot('precision-recall-chart', [], {
+                    title: 'Precision/Recall (Available after epoch completes)',
+                    xaxis: { title: 'Epoch' },
+                    yaxis: { title: 'Score', range: [0, 1] }
+                });
+            }
         }
         
         // Initial update
         updateDashboard();
         
-        // Update every 5 seconds
-        setInterval(updateDashboard, 5000);
+        // Update every 2 seconds
+        setInterval(updateDashboard, 2000);
         
         // Check connection status
         setInterval(() => {
-            if (lastUpdate && Date.now() - lastUpdate > 15000) {
+            if (lastUpdate && Date.now() - lastUpdate > 10000) {
                 document.getElementById('status').className = 'status disconnected';
                 document.getElementById('status').textContent = 'Disconnected';
             }
@@ -489,6 +700,14 @@ def run_visualization_server(metrics_collector, port=5000):
     """Run the Flask visualization server."""
     app = Flask(__name__)
     
+    # Add CORS headers to allow cross-origin requests
+    @app.after_request
+    def after_request(response):
+        response.headers.add('Access-Control-Allow-Origin', '*')
+        response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization')
+        response.headers.add('Access-Control-Allow-Methods', 'GET,PUT,POST,DELETE')
+        return response
+    
     @app.route('/')
     def dashboard():
         return render_template_string(DASHBOARD_HTML)
@@ -499,14 +718,13 @@ def run_visualization_server(metrics_collector, port=5000):
     
     # Run in a separate thread
     def run_server():
-        app.run(host='0.0.0.0', port=port, debug=False, threaded=True)
+        app.run(host='127.0.0.1', port=port, debug=False, threaded=True)
     
     server_thread = threading.Thread(target=run_server, daemon=True)
     server_thread.start()
     
-    print(f"\n📊 Visualization dashboard running on port {port}")
-    print(f"📊 If using ML Foundry, check your job's 'Ports' section to get the public URL")
-    print(f"📊 Otherwise, use SSH port forwarding: ssh -L {port}:localhost:{port} user@host\n")
+    print(f"\n📊 Visualization dashboard running at http://localhost:{port}")
+    print(f"📊 Open dashboard.html in your browser to see real-time training metrics\n")
 
 
 def download_blob(args):
@@ -710,12 +928,12 @@ def main():
     # --- Configuration ---
     SOURCE_DATA_CONTAINER = "2ktestsidewalk60"
     CHECKPOINT_CONTAINER = "2ktestyolosidewalk60"
-    LOCAL_DATA_DIR = "/mnt/data/yolo_sidewalk"
-    NUM_EPOCHS = 300
-    BATCH_SIZE = 64  # Total batch size across all GPUs
-    DEVICE = '0,1,2,3'  # Use 4 GPUs
+    LOCAL_DATA_DIR = "sidewalk-foundry-data"
+    NUM_EPOCHS = 1
+    BATCH_SIZE = 8  # Total batch size across all GPUs
+    DEVICE = 'cpu'  # Use 4 GPUs
     SAVE_PERIOD = 5
-    VISUALIZATION_PORT = 5000
+    VISUALIZATION_PORT = 9000
     
     # Create YOLO config directory
     os.makedirs('/tmp/yolo_config', exist_ok=True)
@@ -794,18 +1012,18 @@ def main():
                         shutil.copy(weights_path, resume_path)
                     else:
                         print("Weights file not found in checkpoint, starting from scratch...")
-                        model = YOLO('yolo11x-seg.pt')
+                        model = YOLO('yolo11n-seg.pt')
                 else:
                     print("Failed to extract checkpoint, starting from scratch...")
-                    model = YOLO('yolo11x-seg.pt')
+                    model = YOLO('yolo11n-seg.pt')
         else:
             print("No checkpoints found, starting from scratch...")
-            model = YOLO('yolo11x-seg.pt')
+            model = YOLO('yolo11n-seg.pt')
     
     except Exception as e:
         print(f"Error checking for checkpoints: {e}")
         print("Starting training from scratch...")
-        model = YOLO('yolo11x-seg.pt')
+        model = YOLO('yolo11n-seg.pt')
     
     # Set total epochs in metrics collector
     metrics_collector.set_total_epochs(NUM_EPOCHS)
