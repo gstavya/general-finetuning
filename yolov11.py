@@ -683,7 +683,7 @@ def main():
     SOURCE_DATA_CONTAINER = "2ktestsidewalk60"
     CHECKPOINT_CONTAINER = "quicktestyolo"
     LOCAL_DATA_DIR = "/mnt/data/yolo_sidewalk"
-    NUM_EPOCHS = 300
+    NUM_EPOCHS = 2
     BATCH_SIZE = 64  # Total batch size across all GPUs
     DEVICE = '0,1,2,3'  # Use 4 GPUs
     SAVE_PERIOD = 5
