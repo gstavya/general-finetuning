@@ -8,3 +8,8 @@ numpy
 ultralytics
 opencv-python
 pyyaml
+flask
+pandas
+matplotlib
+seaborn
+scipy
