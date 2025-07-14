@@ -219,7 +219,7 @@ def create_data_yaml(local_data_dir):
 def main():
     # --- Configuration ---
     SOURCE_DATA_CONTAINER = "4ksidewalk60"
-    CHECKPOINT_CONTAINER = "4ksidewalk60yolonoaugmentations"
+    CHECKPOINT_CONTAINER = "4ksidewalk60yolowithpatience"
     LOCAL_DATA_DIR = "/mnt/data/yolo_sidewalk"
     NUM_EPOCHS = 300
     BATCH_SIZE = 256  # Total batch size across all GPUs
