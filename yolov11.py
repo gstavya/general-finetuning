@@ -318,39 +318,68 @@ def main():
 
     # Custom training callback to save complete checkpoints
     def on_train_epoch_end(trainer):
-        """Callback to save complete checkpoint and display metrics."""
+        """Callback to save complete checkpoint and all metrics."""
         # Increment epoch counter
         callback_config['epoch_counter'] += 1
-
-        # Calculate actual epoch considering resume
         actual_epoch = callback_config['start_epoch'] + callback_config['epoch_counter']
-
-        # Display validation metrics
-        print(f"\n--- Epoch {actual_epoch} Validation Metrics ---")
-        print(f"(Internal epoch: {trainer.epoch + 1}, Counter: {callback_config['epoch_counter']})")
-
+    
+        print(f"\n--- Epoch {actual_epoch} Validation & Metrics ---")
+        
+        # Initialize a dictionary to hold all metrics for this epoch
+        epoch_metrics = {
+            'epoch': actual_epoch,
+            'train_loss': {},
+            'val_metrics': {}
+        }
+    
         try:
+            # 1. Get training losses from the trainer object
+            if hasattr(trainer, 'last_train_metrics'):
+                epoch_metrics['train_loss'] = trainer.last_train_metrics
+    
+            # 2. Run validation and get validation metrics
             metrics = trainer.model.val(data=callback_config['data_yaml'], verbose=False)
-
-            print(f"Box Metrics:")
-            print(f"  Precision: {metrics.box.p.mean():.4f}")
-            print(f"  Recall: {metrics.box.r.mean():.4f}")
-            print(f"  mAP50: {metrics.box.map50:.4f}")
-            print(f"  mAP50-95: {metrics.box.map:.4f}")
-
-            print(f"Mask Metrics:")
-            print(f"  Precision: {metrics.seg.p.mean():.4f}")
-            print(f"  Recall: {metrics.seg.r.mean():.4f}")
-            print(f"  mAP50: {metrics.seg.map50:.4f}")
-            print(f"  mAP50-95: {metrics.seg.map:.4f}")
-            print("------------------------------------\n")
+            
+            # Store box and segmentation metrics
+            epoch_metrics['val_metrics'] = {
+                'box': {
+                    'precision': metrics.box.p.mean(),
+                    'recall': metrics.box.r.mean(),
+                    'map50': metrics.box.map50,
+                    'map50_95': metrics.box.map
+                },
+                'seg': {
+                    'precision': metrics.seg.p.mean(),
+                    'recall': metrics.seg.r.mean(),
+                    'map50': metrics.seg.map50,
+                    'map50_95': metrics.seg.map
+                }
+            }
+    
+            # Print metrics for real-time monitoring
+            print(f"  Training Box Loss: {epoch_metrics['train_loss'].get('box_loss', 'N/A'):.4f}")
+            print(f"  Training Seg Loss: {epoch_metrics['train_loss'].get('seg_loss', 'N/A'):.4f}")
+            print(f"  Validation mAP50-95 (Box): {epoch_metrics['val_metrics']['box']['map50_95']:.4f}")
+            print(f"  Validation mAP50-95 (Seg): {epoch_metrics['val_metrics']['seg']['map50_95']:.4f}")
+    
         except Exception as e:
-            print(f"Error calculating validation metrics: {e}")
-            print("------------------------------------\n")
-
-        # Save checkpoint every SAVE_PERIOD epochs
+            print(f"Error calculating or retrieving metrics: {e}")
+        
+        print("---------------------------------------------")
+    
+        # 3. Save the collected metrics to a file in /mnt/data
+        results_path = "/mnt/data/training_metrics.jsonl"
+        try:
+            with open(results_path, 'a') as f:
+                # Convert dictionary to a JSON string and write it as a new line
+                f.write(json.dumps(epoch_metrics) + '\n')
+            print(f"✅ Metrics for epoch {actual_epoch} saved to {results_path}")
+        except Exception as e:
+            print(f"❌ Failed to save metrics for epoch {actual_epoch}. Error: {e}")
+    
+        # --- Your existing checkpoint saving logic ---
         if actual_epoch % callback_config['save_period'] == 0:
-            print(f"📸 Saving checkpoint at epoch {actual_epoch} (divisible by {callback_config['save_period']})")
+            print(f"📸 Saving checkpoint at epoch {actual_epoch}...")
             save_full_checkpoint_to_azure(
                 trainer,
                 callback_config['connection_string'],
@@ -358,7 +387,8 @@ def main():
                 actual_epoch
             )
         else:
-            print(f"ℹ️  Epoch {actual_epoch} - Not saving (next save at epoch {((actual_epoch // callback_config['save_period']) + 1) * callback_config['save_period']})")
+            next_save = ((actual_epoch // callback_config['save_period']) + 1) * callback_config['save_period']
+            print(f"ℹ️  Epoch {actual_epoch} - Not saving checkpoint (next save at epoch {next_save})")
 
     # Also add a callback that runs after each epoch completes (alternative hook)
     def on_train_epoch_end_alt(trainer):
