@@ -432,7 +432,7 @@ def main():
             'imgsz': 640,
             'device': DEVICE,
             'workers': 8,
-            'patience': 0,  # Disable early stopping
+            'patience': 30,  # Disable early stopping
             'save': True,
             'save_period': -1,  # Disable default saving
             'project': temp_project_dir,
