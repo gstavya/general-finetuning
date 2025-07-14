@@ -479,20 +479,21 @@ def main():
 
         # Save as both final model and final checkpoint
         final_blob_name = "yolov11x_seg_sidewalk_final.pt"
-        best_model_path = os.path.join(temp_project_dir, 'yolov11x_seg_sidewalk', 'weights', 'best.pt')
-
-        if os.path.exists(best_model_path):
+        # Point to the model from the last epoch instead of the best one
+        final_model_path = os.path.join(temp_project_dir, 'yolov11x_seg_sidewalk', 'weights', 'last.pt')
+        
+        if os.path.exists(final_model_path):
             try:
                 blob_service_client = BlobServiceClient.from_connection_string(connection_string)
                 blob_client = blob_service_client.get_blob_client(
                     container=CHECKPOINT_CONTAINER, 
                     blob=final_blob_name
                 )
-
-                with open(best_model_path, "rb") as data:
+        
+                with open(final_model_path, "rb") as data:
                     blob_client.upload_blob(data, overwrite=True)
-                print(f"✅ Final model uploaded to Azure as: {final_blob_name}")
-
+                print(f"✅ Final model from the last epoch uploaded to Azure as: {final_blob_name}")
+        
                 # Also save a complete final checkpoint
                 # Get trainer from the model's last training session
                 if hasattr(model, 'trainer'):
@@ -502,7 +503,7 @@ def main():
                         CHECKPOINT_CONTAINER,
                         NUM_EPOCHS
                     )
-
+        
             except Exception as e:
                 print(f"Failed to upload final model: {e}")
 
