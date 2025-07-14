@@ -1012,18 +1012,18 @@ def main():
                         shutil.copy(weights_path, resume_path)
                     else:
                         print("Weights file not found in checkpoint, starting from scratch...")
-                        model = YOLO('yolo11n-seg.pt')
+                        model = YOLO('yolo11x-seg.pt')
                 else:
                     print("Failed to extract checkpoint, starting from scratch...")
-                    model = YOLO('yolo11n-seg.pt')
+                    model = YOLO('yolo11x-seg.pt')
         else:
             print("No checkpoints found, starting from scratch...")
-            model = YOLO('yolo11n-seg.pt')
+            model = YOLO('yolo11x-seg.pt')
     
     except Exception as e:
         print(f"Error checking for checkpoints: {e}")
         print("Starting training from scratch...")
-        model = YOLO('yolo11n-seg.pt')
+        model = YOLO('yolo11x-seg.pt')
     
     # Set total epochs in metrics collector
     metrics_collector.set_total_epochs(NUM_EPOCHS)
