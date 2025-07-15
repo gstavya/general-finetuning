@@ -188,7 +188,7 @@ def create_data_yaml(local_data_dir):
         if 'train' in data_config:
             data_config['train'] = os.path.join(os.path.abspath(local_data_dir), 'train/images')
         if 'val' in data_config:
-            data_config['val'] = os.path.join(os.path.abspath(local_data_dir), 'valid/images')
+            data_config['val'] = os.path.join(os.path.abspath(local_data_dir), 'val/images')
         if 'test' in data_config:
             data_config['test'] = os.path.join(os.path.abspath(local_data_dir), 'test/images')
 
@@ -205,7 +205,7 @@ def create_data_yaml(local_data_dir):
         data_config = {
             'path': os.path.abspath(local_data_dir),
             'train': os.path.join(os.path.abspath(local_data_dir), 'train/images'),
-            'val': os.path.join(os.path.abspath(local_data_dir), 'valid/images'),
+            'val': os.path.join(os.path.abspath(local_data_dir), 'val/images'),
             'test': os.path.join(os.path.abspath(local_data_dir), 'test/images'),
             'nc': 1,  # Number of classes
             'names': ['sidewalk']  # Class names
