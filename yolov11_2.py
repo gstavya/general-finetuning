@@ -97,9 +97,15 @@ def save_full_checkpoint_to_azure(trainer, connection_string, container_name, ep
             checkpoint_dir = os.path.join(temp_dir, f'checkpoint_epoch_{epoch}')
             os.makedirs(checkpoint_dir, exist_ok=True)
 
-            # Save the model weights
+            # --- MODIFICATION START ---
+            # Save the model weights by copying the last saved model from the trainer
             weights_path = os.path.join(checkpoint_dir, 'weights.pt')
-            trainer.save_model(weights_path)
+            if trainer.last:  # Check if a path to the last model exists
+                shutil.copy(trainer.last, weights_path)
+            else: # Fallback for older versions or if trainer.last is not available
+                trainer.model.save(weights_path)
+            # --- MODIFICATION END ---
+            
             print(f"  ✓ Model weights saved")
 
             # Save optimizer state
@@ -107,13 +113,15 @@ def save_full_checkpoint_to_azure(trainer, connection_string, container_name, ep
             torch.save(trainer.optimizer.state_dict(), optimizer_path)
             print(f"  ✓ Optimizer state saved")
 
+            # ... (rest of the function remains the same) ...
+            
             # Save training args and state
             training_state = {
                 'epoch': epoch,
                 'best_fitness': trainer.best_fitness,
                 'fitness': trainer.fitness,
                 'ema': trainer.ema.state_dict() if hasattr(trainer, 'ema') and trainer.ema else None,
-                'updates': trainer.optimizer.state_dict()['state'].get(0, {}).get('step', 0) if trainer.optimizer else 0,
+                'updates': trainer.optimizer.state_dict()['state'].get(0, {})['step'] if trainer.optimizer and trainer.optimizer.state_dict()['state'] else 0,
                 'train_args': vars(trainer.args),
             }
 
