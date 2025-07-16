@@ -11,6 +11,7 @@ import tempfile
 import warnings
 import shutil
 import json
+import albumentations as A
 
 # Set YOLO config directory to avoid permission warnings
 os.environ['YOLO_CONFIG_DIR'] = '/tmp/yolo_config'
