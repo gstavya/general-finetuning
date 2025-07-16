@@ -301,18 +301,18 @@ def main():
                         shutil.copy(weights_path, resume_path)
                     else:
                         print("Weights file not found in checkpoint, starting from scratch...")
-                        model = YOLO('yolo11x-seg.pt')
+                        model = YOLO('yolo11l-seg.pt')
                 else:
                     print("Failed to extract checkpoint, starting from scratch...")
-                    model = YOLO('yolo11x-seg.pt')
+                    model = YOLO('yolo11l-seg.pt')
         else:
             print("No checkpoints found, starting from scratch...")
-            model = YOLO('yolo11x-seg.pt')
+            model = YOLO('yolo11l-seg.pt')
 
     except Exception as e:
         print(f"Error checking for checkpoints: {e}")
         print("Starting training from scratch...")
-        model = YOLO('yolo11x-seg.pt')
+        model = YOLO('yolo11l-seg.pt')
 
     # Store connection string and container name for callback
     callback_config = {
@@ -444,7 +444,7 @@ def main():
             'save': True,
             'save_period': -1,  # Disable default saving
             'project': temp_project_dir,
-            'name': 'yolov11x_seg_sidewalk',
+            'name': 'yolov11l_seg_sidewalk',
             'exist_ok': True,
             'pretrained': False,  # Already have a model
             'resume': resume_path if resume_path and os.path.exists(resume_path) else False,
@@ -486,9 +486,9 @@ def main():
         print("\nSaving final model to Azure...")
 
         # Save as both final model and final checkpoint
-        final_blob_name = "yolov11x_seg_sidewalk_final.pt"
+        final_blob_name = "yolov11l_seg_sidewalk_final.pt"
         # Point to the model from the last epoch instead of the best one
-        final_model_path = os.path.join(temp_project_dir, 'yolov11x_seg_sidewalk', 'weights', 'last.pt')
+        final_model_path = os.path.join(temp_project_dir, 'yolov11l_seg_sidewalk', 'weights', 'last.pt')
         
         if os.path.exists(final_model_path):
             try:
