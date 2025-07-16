@@ -51,22 +51,25 @@ def process_blob(args):
         return f"Failed to process {blob_name}: {e}"
 
 # --- Checkpoint upload function (Modified for rank 0 only) ---
-def upload_checkpoint_to_azure(connection_string, container_name, local_file_path, blob_name, rank):
+def upload_checkpoint_to_azure(connection_string, container_name, local_file_path, blob_name_prefix, epoch, rank):
     if rank != 0:  # Only rank 0 uploads
         return
+
+    blob_name = f"{blob_name_prefix}_epoch_{epoch:03d}.pth" # Dynamic naming for each epoch
     try:
         blob_service_client = BlobServiceClient.from_connection_string(connection_string)
         try:
             container_client = blob_service_client.create_container(container_name)
-        except Exception:
+        except Exception: # Container might already exist, so just get it
             container_client = blob_service_client.get_container_client(container_name)
+
         blob_client = container_client.get_blob_client(blob_name)
-        print(f"Uploading '{blob_name}' to Azure container '{container_name}'...")
+        print(f"Uploading checkpoint for epoch {epoch} as '{blob_name}' to Azure container '{container_name}'...")
         with open(local_file_path, "rb") as data:
-            blob_client.upload_blob(data, overwrite=True)
+            blob_client.upload_blob(data, overwrite=True) # Always overwrite the same epoch's file if re-run, or create new
         print("✅ Upload complete.")
     except Exception as e:
-        print(f"WARNING: Failed to upload to Azure. Error: {e}")
+        print(f"WARNING: Failed to upload to Azure for epoch {epoch}. Error: {e}")
 
 # --- Preprocessing orchestrator (Modified for rank 0 only) ---
 def preprocess_and_save_locally(connection_string, source_container, local_target_dir, patch_size=224, rank=0):
