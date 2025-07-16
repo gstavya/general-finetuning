@@ -232,7 +232,7 @@ def main():
     NUM_EPOCHS = 300
     BATCH_SIZE = 256  # Total batch size across all GPUs
     DEVICE = '0,1,2,3'  # Use 4 GPUs
-    SAVE_PERIOD = 5
+    SAVE_PERIOD = 50
 
     # Create YOLO config directory
     os.makedirs('/tmp/yolo_config', exist_ok=True)
