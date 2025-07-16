@@ -456,19 +456,19 @@ def main():
             'amp': True,
 
             # Augmentation parameters
-            'hsv_h': 0.015,
-            'hsv_s': 0.7,
-            'hsv_v': 0.4,
-            'degrees': 0.0,
-            'translate': 0.1,
-            'scale': 0.5,
-            'shear': 0.0,
-            'perspective': 0.0,
-            'flipud': 0.0,
-            'fliplr': 0.5,
-            'mosaic': 1.0,
-            'mixup': 0.0,
-            'copy_paste': 0.0,
+            'hsv_h': 0.015,         # image HSV-Hue augmentation (fraction)
+            'hsv_s': 0.7,           # image HSV-Saturation augmentation (fraction)
+            'hsv_v': 0.4,           # image HSV-Value augmentation (fraction)
+            'degrees': 0.0,         # image rotation (+/- deg)
+            'translate': 0.1,       # image translation (+/- fraction)
+            'scale': 0.5,           # image scale (+/- gain)
+            'shear': 0.0,           # image shear (+/- deg)
+            'perspective': 0.0,     # image perspective (+/- fraction), range 0-0.001
+            'flipud': 0.0,          # image flip up-down (probability)
+            'fliplr': 0.5,          # image flip left-right (probability)
+            'mosaic': 1.0,          # mosaic augmentation (probability)
+            'mixup': 0.0,           # mixup augmentation (probability)
+            'copy_paste': 0.0,      # copy-paste augmentation (probability)
 
             # Segmentation specific
             'overlap_mask': True,
