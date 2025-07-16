@@ -118,6 +118,13 @@ class PatchedImageDataset(Dataset):
                 return view, 0
         return patch, 0
 
+# --- GLOBAL SCOPE: BYOLTransformWrapper moved here to be picklable ---
+class BYOLTransformWrapper:
+    def __init__(self, transform):
+        self.transform = transform
+    def __call__(self, image):
+        return self.transform(image), self.transform(image)
+
 # --- Helper function for EMA Cosine Scheduling ---
 def get_ema_decay(epoch, total_epochs, start_decay=0.99, end_decay=1.0):
     """
@@ -192,7 +199,8 @@ def main_worker(rank, world_size):
     # --- Data Splitting (All ranks need same split) ---
     all_patches = glob.glob(os.path.join(LOCAL_PATCH_CACHE_DIR, '*.png'))
     if not all_patches:
-        print(f"Error: No patches found in '{LOCAL_PATCH_CACHE_DIR}'. Aborting.")
+        if rank == 0:
+            print(f"Error: No patches found in '{LOCAL_PATCH_CACHE_DIR}'. Aborting.")
         cleanup()
         return
 
@@ -221,12 +229,6 @@ def main_worker(rank, world_size):
         T.Resize((PATCH_SIZE, PATCH_SIZE)), v2_transforms,
         T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     ])
-
-    class BYOLTransformWrapper:
-        def __init__(self, transform):
-            self.transform = transform
-        def __call__(self, image):
-            return self.transform(image), self.transform(image)
 
     # --- Datasets and DataLoaders with DistributedSampler ---
     train_dataset = PatchedImageDataset(train_paths, transform=BYOLTransformWrapper(train_transform), mode='train')
@@ -266,23 +268,18 @@ def main_worker(rank, world_size):
 
     # --- Checkpoint Loading ---
     start_epoch = 0
-    # No longer tracking 'best_val_loss' for saving, but keeping it for consistent logging if desired.
     best_val_loss = float('inf') # Initial value
 
     if rank == 0:
         os.makedirs(LOCAL_MODEL_OUTPUT_DIR, exist_ok=True)
 
     CHECKPOINT_CONTAINER = "resnet18-optimized"
-    # Logic to find the latest epoch checkpoint to resume from
-    # This assumes checkpoints are named 'model_checkpoint_epoch_XXX.pth'
     if rank == 0:
         print(f"Attempting to load the latest epoch checkpoint for resumption...")
     try:
         blob_service_client = BlobServiceClient.from_connection_string(connection_string)
         container_client = blob_service_client.get_container_client(CHECKPOINT_CONTAINER)
 
-        # List blobs and find the one with the highest epoch number
-        # Example blob name: "model_checkpoint_epoch_005.pth"
         latest_blob_name = None
         max_epoch_found = -1
         for blob in container_client.list_blobs():
@@ -294,7 +291,7 @@ def main_worker(rank, world_size):
                         max_epoch_found = epoch_num
                         latest_blob_name = blob.name
                 except ValueError:
-                    continue # Skip if epoch number is not an integer
+                    continue
 
         if latest_blob_name:
             if rank == 0:
@@ -304,7 +301,6 @@ def main_worker(rank, world_size):
             buffer = io.BytesIO(downloader.readall())
             checkpoint = torch.load(buffer, map_location=DEVICE)
 
-            # Load state dicts (handle DDP state dict keys)
             online_network.module.load_state_dict(checkpoint['online_network_state_dict'])
             target_network.load_state_dict(checkpoint['target_network_state_dict'])
             prediction_head.module.load_state_dict(checkpoint['prediction_head_state_dict'])
@@ -312,7 +308,7 @@ def main_worker(rank, world_size):
             if 'scheduler_state_dict' in checkpoint:
                 scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
             start_epoch = checkpoint['epoch'] + 1
-            best_val_loss = checkpoint.get('best_val_loss', float('inf')) # Keep this for logging best if needed
+            best_val_loss = checkpoint.get('best_val_loss', float('inf'))
 
             if rank == 0:
                 print(f"✅ State loaded. Resuming from epoch {start_epoch}.")
@@ -329,10 +325,7 @@ def main_worker(rank, world_size):
         print(f"Starting training for {NUM_EPOCHS} epochs...")
 
     for epoch in range(start_epoch, NUM_EPOCHS):
-        # Set epoch for distributed sampler
         train_sampler.set_epoch(epoch)
-
-        # Calculate current EMA decay for the epoch
         current_ema_decay = get_ema_decay(epoch, NUM_EPOCHS, START_EMA_DECAY, END_EMA_DECAY)
 
         # --- Training Phase ---
@@ -340,7 +333,6 @@ def main_worker(rank, world_size):
         prediction_head.train()
         total_train_loss = 0.0
 
-        # Only show progress bar on rank 0
         train_iter = train_loader
         if rank == 0:
             train_iter = tqdm(train_loader, desc=f"Epoch {epoch+1}/{NUM_EPOCHS} [Train]")
@@ -360,10 +352,8 @@ def main_worker(rank, world_size):
             loss.backward()
             optimizer.step()
 
-            # Update EMA on all ranks
             update_moving_average(target_network, online_network.module, decay=current_ema_decay)
 
-        # Gather train loss from all ranks
         avg_train_loss = total_train_loss / len(train_loader)
         train_loss_tensor = torch.tensor(avg_train_loss).to(DEVICE)
         dist.all_reduce(train_loss_tensor, op=dist.ReduceOp.AVG)
@@ -381,15 +371,13 @@ def main_worker(rank, world_size):
         with torch.no_grad():
             for view1, _ in val_iter:
                 view1 = view1.to(DEVICE)
-                view2 = view1.clone() # For validation, we typically evaluate on one view, but BYOL loss expects two
-                                     # Using clone() for the second view with no augmentation is fine for loss calc.
+                view2 = view1.clone()
                 z0_online, z1_online = online_network(view1), online_network(view2)
                 z0_target, z1_target = target_network(view1), target_network(view2)
                 p0, p1 = prediction_head(z0_online), prediction_head(z1_online)
                 val_loss = 0.5 * (loss_fn(p0, z1_target.detach()) + loss_fn(p1, z0_target.detach()))
                 total_val_loss += val_loss.item()
 
-        # Gather validation loss from all ranks
         avg_val_loss = total_val_loss / len(val_loader)
         val_loss_tensor = torch.tensor(avg_val_loss).to(DEVICE)
         dist.all_reduce(val_loss_tensor, op=dist.ReduceOp.AVG)
@@ -402,8 +390,6 @@ def main_worker(rank, world_size):
             print(f"Current LR: {scheduler.get_last_lr()[0]:.6f}, Current EMA Decay: {current_ema_decay:.6f}")
 
             # --- Checkpoint Saving for EVERY EPOCH (rank 0 only) ---
-            # Define a local path for the current epoch's checkpoint
-            # Using epoch+1 for 1-indexed naming (e.g., epoch_001.pth)
             current_epoch_checkpoint_filename = f"model_checkpoint_epoch_{epoch+1:03d}.pth"
             current_epoch_checkpoint_path = os.path.join(LOCAL_MODEL_OUTPUT_DIR, current_epoch_checkpoint_filename)
 
@@ -416,22 +402,18 @@ def main_worker(rank, world_size):
                 'scheduler_state_dict': scheduler.state_dict(),
                 'train_loss': avg_train_loss,
                 'val_loss': avg_val_loss,
-                'best_val_loss': min(best_val_loss, avg_val_loss) # Still update best_val_loss for internal tracking/logging
+                'best_val_loss': min(best_val_loss, avg_val_loss)
             }, current_epoch_checkpoint_path)
             print(f"✅ Checkpoint for epoch {epoch+1} saved locally: {current_epoch_checkpoint_path}")
 
-            # Upload this specific epoch's checkpoint to Azure
             upload_checkpoint_to_azure(
                 connection_string,
                 CHECKPOINT_CONTAINER,
                 current_epoch_checkpoint_path,
-                current_epoch_checkpoint_filename, # Use the full filename as the blob name
+                current_epoch_checkpoint_filename,
                 rank
             )
 
-            # Optional: Save a "latest_resume_checkpoint.pth" to simplify resumption logic
-            # This blob will always point to the most recently saved full state,
-            # allowing the startup logic to simply load this one without scanning all blobs.
             latest_resume_blob_name = "latest_resume_checkpoint.pth"
             latest_resume_checkpoint_path = os.path.join(LOCAL_MODEL_OUTPUT_DIR, latest_resume_blob_name)
             shutil.copyfile(current_epoch_checkpoint_path, latest_resume_checkpoint_path)
@@ -450,14 +432,10 @@ def main_worker(rank, world_size):
         print("\n" + "="*50)
         print("Training finished. Evaluating model on the test set from the LAST completed epoch...")
 
-    # Determine the checkpoint to load for final testing: the one from the very last trained epoch
-    # We will try to load the `latest_resume_checkpoint.pth` for final testing,
-    # as it represents the state after the last completed epoch.
     final_model_blob_name = "latest_resume_checkpoint.pth"
     final_model_path_local = os.path.join(LOCAL_MODEL_OUTPUT_DIR, final_model_blob_name)
 
     try:
-        # Download the final epoch's checkpoint from Azure if it's not present locally
         if not os.path.exists(final_model_path_local):
             if rank == 0:
                 print(f"Downloading final checkpoint '{final_model_blob_name}' from Azure...")
@@ -471,8 +449,6 @@ def main_worker(rank, world_size):
 
         final_checkpoint = torch.load(final_model_path_local, map_location=DEVICE)
         online_network.module.load_state_dict(final_checkpoint['online_network_state_dict'])
-        # It's generally a good idea to load target_network and prediction_head states for consistency
-        # during evaluation, even if not strictly needed for this specific loss calculation.
         target_network.load_state_dict(final_checkpoint['target_network_state_dict'])
         prediction_head.module.load_state_dict(final_checkpoint['prediction_head_state_dict'])
 
@@ -490,7 +466,6 @@ def main_worker(rank, world_size):
         with torch.no_grad():
             for view1, _ in test_iter:
                 view1 = view1.to(DEVICE)
-                # For consistency with BYOL loss, still generate two views for input to networks
                 view2 = view1.clone()
                 z0_online, z1_online = online_network(view1), online_network(view2)
                 z0_target, z1_target = target_network(view1), target_network(view2)
@@ -498,7 +473,6 @@ def main_worker(rank, world_size):
                 test_loss = 0.5 * (loss_fn(p0, z1_target.detach()) + loss_fn(p1, z0_target.detach()))
                 total_test_loss += test_loss.item()
 
-        # Gather test loss from all ranks
         avg_test_loss = total_test_loss / len(test_loader)
         test_loss_tensor = torch.tensor(avg_test_loss).to(DEVICE)
         dist.all_reduce(test_loss_tensor, op=dist.ReduceOp.AVG)
@@ -517,7 +491,6 @@ def main_worker(rank, world_size):
     if rank == 0:
         print(f"Saving final model backbone from the last epoch to local directory...")
         final_backbone_path = os.path.join(LOCAL_MODEL_OUTPUT_DIR, "resnet18_backbone_final_epoch.pth")
-        # Save the backbone from the online network (which is the one trained)
         torch.save(online_network.module[0].state_dict(), final_backbone_path)
         print(f"✅ Final backbone saved to: {final_backbone_path}")
 
