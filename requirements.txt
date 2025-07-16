@@ -5,12 +5,13 @@ tqdm
 Pillow
 azure-storage-blob
 numpy
-ultralytics
-opencv-python
-pyyaml
-flask
+scikit-learn
 pandas
 matplotlib
 seaborn
 scipy
+pyyaml
+ultralytics
+opencv-python
 wandb
+flask
