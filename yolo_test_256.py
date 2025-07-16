@@ -11,6 +11,7 @@ import tempfile
 import warnings
 import shutil
 import json
+import time # Import time for potential sleep
 
 # Set YOLO config directory to avoid permission warnings
 os.environ['YOLO_CONFIG_DIR'] = '/tmp/yolo_config'
@@ -18,6 +19,130 @@ os.environ['YOLO_CONFIG_DIR'] = '/tmp/yolo_config'
 # Suppress Ultralytics warnings during multiprocessing
 warnings.filterwarnings('ignore', message='user config directory')
 warnings.filterwarnings('ignore', message='Error decoding JSON')
+
+# --- (Your download_blob, download_from_azure, download_and_extract_checkpoint, create_data_yaml functions remain unchanged) ---
+# Paste them here if you want a single runnable block for testing, otherwise assume they are defined above.
+
+def save_full_checkpoint_to_azure(trainer, connection_string, container_name, epoch):
+    """Save complete checkpoint with all training state to Azure."""
+    try:
+        print(f"\n🔄 Starting checkpoint save for epoch {epoch}...")
+
+        blob_service_client = BlobServiceClient.from_connection_string(connection_string)
+
+        # Ensure container exists
+        try:
+            container_client = blob_service_client.create_container(container_name)
+            print(f"Container '{container_name}' created.")
+        except Exception as e:
+            if "ContainerAlreadyExists" in str(e):
+                container_client = blob_service_client.get_container_client(container_name)
+                print(f"Container '{container_name}' already exists.")
+            else:
+                raise # Re-raise other exceptions
+
+        # Create temporary directory for checkpoint files
+        with tempfile.TemporaryDirectory() as temp_dir:
+            checkpoint_dir = os.path.join(temp_dir, f'checkpoint_epoch_{epoch}')
+            os.makedirs(checkpoint_dir, exist_ok=True)
+            print(f"  DEBUG: Checkpoint temporary directory created at: {checkpoint_dir}")
+
+            # --- Save the model weights ---
+            weights_path = os.path.join(checkpoint_dir, 'weights.pt')
+            
+            # CRITICAL CHECK: Verify trainer.last and wait if necessary
+            if trainer.last and os.path.exists(trainer.last):
+                # Add a small delay to ensure file is fully written by Ultralytics
+                # This is a common workaround for callback timing issues
+                time.sleep(0.5) 
+                
+                try:
+                    shutil.copy(trainer.last, weights_path)
+                    print(f"  ✓ Model weights copied from {trainer.last}")
+                    print(f"  DEBUG: Copied weights file size: {os.path.getsize(weights_path)} bytes")
+                except Exception as copy_e:
+                    print(f"  ❌ ERROR: Failed to copy model weights from {trainer.last}. Error: {copy_e}")
+                    # Fallback to direct save if copy fails
+                    print("  Attempting direct model save as fallback...")
+                    trainer.model.save(weights_path)
+                    print(f"  ✓ Model weights (fallback direct save) saved")
+            else:
+                print(f"  DEBUG: trainer.last is not available or path does not exist: {trainer.last}")
+                print("  Attempting direct model save as fallback...")
+                trainer.model.save(weights_path)
+                print(f"  ✓ Model weights (fallback direct save) saved")
+            
+            # Save optimizer state
+            optimizer_path = os.path.join(checkpoint_dir, 'optimizer.pt')
+            if hasattr(trainer, 'optimizer') and trainer.optimizer: # More robust check
+                try:
+                    torch.save(trainer.optimizer.state_dict(), optimizer_path)
+                    print(f"  ✓ Optimizer state saved")
+                except Exception as opt_e:
+                    print(f"  ❌ ERROR: Failed to save optimizer state. Error: {opt_e}")
+            else:
+                print(f"  ℹ️  Optimizer object not found on trainer or is None.")
+
+            # Save training args and state
+            training_state = {
+                'epoch': epoch,
+                'best_fitness': trainer.best_fitness if hasattr(trainer, 'best_fitness') else None,
+                'fitness': trainer.fitness if hasattr(trainer, 'fitness') else None,
+                'ema': trainer.ema.state_dict() if hasattr(trainer, 'ema') and trainer.ema else None,
+                'updates': trainer.optimizer.state_dict()['state'].get(0, {})['step'] if hasattr(trainer, 'optimizer') and trainer.optimizer and trainer.optimizer.state_dict()['state'] else 0,
+                'train_args': vars(trainer.args) if hasattr(trainer, 'args') and trainer.args else {},
+            }
+
+            state_path = os.path.join(checkpoint_dir, 'training_state.pt')
+            try:
+                torch.save(training_state, state_path)
+                print(f"  ✓ Training state saved")
+            except Exception as state_e:
+                print(f"  ❌ ERROR: Failed to save training state. Error: {state_e}")
+
+            # Save results CSV if exists
+            if hasattr(trainer, 'csv') and trainer.csv and os.path.exists(trainer.csv):
+                try:
+                    shutil.copy(trainer.csv, os.path.join(checkpoint_dir, 'results.csv'))
+                    print(f"  ✓ Results CSV saved from {trainer.csv}")
+                except Exception as csv_e:
+                    print(f"  ❌ ERROR: Failed to copy results CSV from {trainer.csv}. Error: {csv_e}")
+            else:
+                print(f"  ℹ️  No results CSV to save or path invalid: {getattr(trainer, 'csv', 'N/A')}")
+
+            # Create a tar archive of the checkpoint directory
+            tar_path_base = os.path.join(temp_dir, f'checkpoint_epoch_{epoch}')
+            try:
+                shutil.make_archive(tar_path_base, 'tar', checkpoint_dir)
+                tar_path = tar_path_base + '.tar' # make_archive adds the extension
+                print(f"  ✓ Archive created at {tar_path}")
+                print(f"  DEBUG: Archive file size: {os.path.getsize(tar_path)} bytes")
+            except Exception as archive_e:
+                print(f"  ❌ ERROR: Failed to create archive. Error: {archive_e}")
+                raise # Re-raise to stop if archive creation fails
+
+            # Upload the tar file to Azure
+            blob_name = f'checkpoint_epoch_{epoch}.tar'
+            blob_client = container_client.get_blob_client(blob_name)
+
+            print(f"  📤 Uploading to Azure as: {blob_name}...")
+            try:
+                with open(tar_path, "rb") as data:
+                    blob_client.upload_blob(data, overwrite=True)
+                print(f"✅ Checkpoint for epoch {epoch} successfully uploaded to Azure!\n")
+            except Exception as upload_e:
+                print(f"  ❌ ERROR: Failed to upload checkpoint to Azure Blob Storage. Error: {upload_e}")
+                raise # Re-raise to show the full Azure error
+
+    except Exception as e:
+        print(f"❌ WARNING: An unexpected error occurred during checkpoint saving. Error: {e}\n")
+        import traceback
+        traceback.print_exc()
+
+# --- (Your main function and __name__ == '__main__' block remain unchanged) ---
+# You'll need to paste the rest of your original script here to make it runnable.
+# Ensure the main() function calls the save_full_checkpoint_to_azure with the actual trainer object.
+# The `on_train_epoch_end` and `on_epoch_end_alt` callbacks should use this modified function.
 
 def download_blob(args):
     """Worker function to download a single blob."""
@@ -77,81 +202,6 @@ def download_from_azure(connection_string, container_name, local_dir):
     except Exception as e:
         print(f"FATAL: Error downloading from Azure: {e}")
         raise
-
-def save_full_checkpoint_to_azure(trainer, connection_string, container_name, epoch):
-    """Save complete checkpoint with all training state to Azure."""
-    try:
-        print(f"\n🔄 Starting checkpoint save for epoch {epoch}...")
-
-        blob_service_client = BlobServiceClient.from_connection_string(connection_string)
-
-        # Ensure container exists
-        try:
-            container_client = blob_service_client.create_container(container_name)
-            print(f"Container '{container_name}' created.")
-        except Exception:
-            container_client = blob_service_client.get_container_client(container_name)
-
-        # Create temporary directory for checkpoint files
-        with tempfile.TemporaryDirectory() as temp_dir:
-            checkpoint_dir = os.path.join(temp_dir, f'checkpoint_epoch_{epoch}')
-            os.makedirs(checkpoint_dir, exist_ok=True)
-
-            # --- MODIFICATION START ---
-            # Save the model weights by copying the last saved model from the trainer
-            weights_path = os.path.join(checkpoint_dir, 'weights.pt')
-            if trainer.last:  # Check if a path to the last model exists
-                shutil.copy(trainer.last, weights_path)
-            else: # Fallback for older versions or if trainer.last is not available
-                trainer.model.save(weights_path)
-            # --- MODIFICATION END ---
-            
-            print(f"  ✓ Model weights saved")
-
-            # Save optimizer state
-            optimizer_path = os.path.join(checkpoint_dir, 'optimizer.pt')
-            torch.save(trainer.optimizer.state_dict(), optimizer_path)
-            print(f"  ✓ Optimizer state saved")
-
-            # ... (rest of the function remains the same) ...
-            
-            # Save training args and state
-            training_state = {
-                'epoch': epoch,
-                'best_fitness': trainer.best_fitness,
-                'fitness': trainer.fitness,
-                'ema': trainer.ema.state_dict() if hasattr(trainer, 'ema') and trainer.ema else None,
-                'updates': trainer.optimizer.state_dict()['state'].get(0, {})['step'] if trainer.optimizer and trainer.optimizer.state_dict()['state'] else 0,
-                'train_args': vars(trainer.args),
-            }
-
-            state_path = os.path.join(checkpoint_dir, 'training_state.pt')
-            torch.save(training_state, state_path)
-            print(f"  ✓ Training state saved")
-
-            # Save results CSV if exists
-            if hasattr(trainer, 'csv') and trainer.csv and os.path.exists(trainer.csv):
-                shutil.copy(trainer.csv, os.path.join(checkpoint_dir, 'results.csv'))
-                print(f"  ✓ Results CSV saved")
-
-            # Create a tar archive of the checkpoint directory
-            tar_path = os.path.join(temp_dir, f'checkpoint_epoch_{epoch}.tar')
-            shutil.make_archive(tar_path.replace('.tar', ''), 'tar', checkpoint_dir)
-            print(f"  ✓ Archive created")
-
-            # Upload the tar file to Azure
-            blob_name = f'checkpoint_epoch_{epoch}.tar'
-            blob_client = container_client.get_blob_client(blob_name)
-
-            print(f"  📤 Uploading to Azure as: {blob_name}...")
-            with open(tar_path, "rb") as data:
-                blob_client.upload_blob(data, overwrite=True)
-            print(f"✅ Checkpoint for epoch {epoch} successfully uploaded to Azure!\n")
-
-    except Exception as e:
-        print(f"❌ WARNING: Failed to upload checkpoint to Azure. Error: {e}\n")
-        import traceback
-        traceback.print_exc()
 
 def download_and_extract_checkpoint(connection_string, container_name, blob_name, extract_dir):
     """Download and extract checkpoint from Azure."""
@@ -238,7 +288,7 @@ def main():
     os.makedirs('/tmp/yolo_config', exist_ok=True)
 
     # Azure connection string
-    connection_string = "DefaultEndpointsProtocol=https;AccountName=resnettrainingdata;AccountKey=afq0lgt0sj3lq1+b3Y6eeIg+JArkqE5UJL7tHSeM+Bxa0S3aQSK9ZRMZHozG1PJx2rGfwBh7DySr+ASt3w6JmA==;EndpointSuffix=core.windows.net"
+    connection_string = "DefaultEndpointsProtocol=https;AccountName=resnettrainingdata;AccountKey=afq0lgt0sj3lq1+b3Y6eeIg+JArkqE5UJL7tHSeM+Bxa0S3aQSK9ZRMZHozGg1PJx2rGfwBh7DySr+ASt3w6JmA==;EndpointSuffix=core.windows.net"
 
     print(f"Using devices: {DEVICE}")
     print(f"Total batch size: {BATCH_SIZE} (will be split across 4 GPUs)")
