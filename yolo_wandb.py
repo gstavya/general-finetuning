@@ -295,7 +295,7 @@ def main():
     os.makedirs('/tmp/yolo_config', exist_ok=True)
 
     # Azure connection string
-    connection_string = "DefaultEndpointsProtocol=https;AccountName=resnettrainingdata;AccountKey=afq0lgt0sj3lq1+b3Y6eeIg+JArkqE5UJL7tHSeM+Bxa0S3aQSK9ZRMZHozGg1PJx2rGfwBh7DySr+ASt3w6JmA==;EndpointSuffix=core.windows.net"
+    connection_string = "DefaultEndpointsProtocol=https;AccountName=resnettrainingdata;AccountKey=afq0lgt0sj3lq1+b3Y6eeIg+JArkqE5UJL7tHSeM+Bxa0S3aQSK9ZRMZHozG1PJx2rGfwBh7DySr+ASt3w6JmA==;EndpointSuffix=core.windows.net"
 
     print(f"Using devices: {DEVICE}")
     print(f"Total batch size: {BATCH_SIZE} (will be split across 4 GPUs)")
