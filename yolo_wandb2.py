@@ -306,13 +306,13 @@ def main():
     data_yaml_path = create_data_yaml(LOCAL_DATA_DIR)
     print(f"Data configuration file: {data_yaml_path}")
 
-    augment_dataset_10x_yolo_format(
-        source_dir="/mnt/data/yolo_sidewalk",
-        output_dir="/mnt/data/yolo_sidewalk_10x"
-    )
+    # augment_dataset_10x_yolo_format(
+    #     source_dir="/mnt/data/yolo_sidewalk",
+    #     output_dir="/mnt/data/yolo_sidewalk_10x"
+    # )
 
-    data_yaml_path = "/mnt/data/yolo_sidewalk_10x/data.yaml"
-    print(f"Data configuration file: {data_yaml_path}")
+    # data_yaml_path = "/mnt/data/yolo_sidewalk_10x/data.yaml"
+    # print(f"Data configuration file: {data_yaml_path}")
 
     model = YOLO('yolo11x-seg.pt')
     add_wandb_callback(model, enable_model_checkpointing=True)
@@ -324,7 +324,23 @@ def main():
         plots=True, 
         val=True,
         project="ultralytics",
-        name="yolo-sidewalk-run"
+        name="yolo-sidewalk-run",
+        hsv_h=0.015,       # Hue (subtle color shift)
+        hsv_s=0.7,         # Saturation (strong color intensity)
+        hsv_v=0.4,         # Value (moderate brightness)
+        
+        degrees=180.0,      # Rotation (+/- 30 degrees)
+        translate=0.75,     # Translation (+/- 20%)
+        scale=1.5,         # Scale/Zoom (+/- 70%)
+        shear=15,        # Shear (+/- 15 degrees)
+        perspective=0.0005, # Perspective distortion
+        
+        flipud=0.5,        # Flip image up-down
+        fliplr=0.5,        # Flip image left-right
+        
+        mosaic=1.0,        # Mosaic composition
+        mixup=0.5,         # Mixup composition
+        copy_paste=0.5     # Copy-paste for segmentation
     )
     print("\nSaving final model to Azure...")
 
