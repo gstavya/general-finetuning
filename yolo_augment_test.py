@@ -277,7 +277,7 @@ def main():
     CHECKPOINT_CONTAINER = "13ksidewalk60yolo"
     LOCAL_DATA_DIR = "/mnt/data/yolo_sidewalk"
     NUM_EPOCHS = 10
-    BATCH_SIZE = 512
+    BATCH_SIZE = 64
     DEVICE = '0,1,2,3'
 
     # Create YOLO config directory
