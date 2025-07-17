@@ -32,6 +32,112 @@ warnings.filterwarnings('ignore', message='Error decoding JSON')
 
 # --- Helper functions (adjusted for minimal output and no external saving/Wandb) ---
 
+import albumentations as A
+import cv2
+from pathlib import Path
+import numpy as np
+import shutil
+
+def augment_dataset_10x_yolo_format(source_dir, output_dir, num_augmentations=9):
+    """Create 9 augmented versions of training images only, maintaining YOLO structure"""
+    
+    # Create output directory structure
+    for split in ['train', 'val', 'test']:
+        Path(output_dir, split, 'images').mkdir(parents=True, exist_ok=True)
+        Path(output_dir, split, 'labels').mkdir(parents=True, exist_ok=True)
+    
+    # Copy data.yaml if it exists
+    source_yaml = Path(source_dir) / 'data.yaml'
+    if source_yaml.exists():
+        shutil.copy(source_yaml, Path(output_dir) / 'data.yaml')
+    
+    # Process each split
+    for split in ['train', 'val', 'test']:
+        images_dir = Path(source_dir) / split / 'images'
+        labels_dir = Path(source_dir) / split / 'labels'
+        
+        if not images_dir.exists():
+            print(f"Warning: {images_dir} does not exist, skipping...")
+            continue
+            
+        print(f"Processing {split} split...")
+        
+        # Get all images
+        image_files = list(images_dir.glob("*.jpg")) + list(images_dir.glob("*.png"))
+        
+        for img_path in image_files:
+            # Read image
+            image = cv2.imread(str(img_path))
+            if image is None:
+                print(f"Warning: Could not read {img_path}, skipping...")
+                continue
+                
+            # Get corresponding label file
+            label_path = labels_dir / img_path.with_suffix('.txt').name
+            
+            # Save original to new location
+            new_img_path = Path(output_dir) / split / 'images' / img_path.name
+            cv2.imwrite(str(new_img_path), image)
+            
+            # Save original labels
+            if label_path.exists():
+                new_label_path = Path(output_dir) / split / 'labels' / label_path.name
+                shutil.copy(label_path, new_label_path)
+            
+            # Only augment training images
+            if split == 'train':
+                # Define transform without bbox parameters
+                transform = A.Compose([
+                    A.RandomRotate90(p=0.3),
+                    A.HorizontalFlip(p=0.5),
+                    A.VerticalFlip(p=0.5),
+                    A.Transpose(p=0.3),
+                    A.OneOf([
+                        A.GaussNoise(p=1),
+                        A.GaussianBlur(p=1),
+                        A.MotionBlur(p=1),
+                    ], p=0.3),
+                    A.OneOf([
+                        A.OpticalDistortion(p=1),
+                        A.GridDistortion(p=1),
+                        A.ElasticTransform(p=1),
+                    ], p=0.3),
+                    A.OneOf([
+                        A.CLAHE(p=1),
+                        A.RandomBrightnessContrast(p=1),
+                        A.RandomGamma(p=1),
+                    ], p=0.5),
+                    A.ShiftScaleRotate(shift_limit=0.1, scale_limit=0.2, rotate_limit=45, p=0.5),
+                    A.RGBShift(r_shift_limit=25, g_shift_limit=25, b_shift_limit=25, p=0.5),
+                    A.RandomShadow(p=0.3),
+                    A.RandomFog(p=0.3),
+                ])
+                
+                # Generate augmented versions
+                for i in range(num_augmentations):
+                    try:
+                        # Apply augmentation to image only
+                        augmented = transform(image=image)
+                        
+                        # Save augmented image
+                        aug_img_name = f"{img_path.stem}_aug{i}{img_path.suffix}"
+                        aug_img_path = Path(output_dir) / 'train' / 'images' / aug_img_name
+                        cv2.imwrite(str(aug_img_path), augmented['image'])
+                        
+                        # Copy labels as-is (keeping invalid boxes)
+                        if label_path.exists():
+                            aug_label_path = Path(output_dir) / 'train' / 'labels' / f"{img_path.stem}_aug{i}.txt"
+                            shutil.copy(label_path, aug_label_path)
+                            
+                    except Exception as e:
+                        print(f"Warning: Augmentation failed for {img_path}: {e}")
+                        continue
+        
+        if split == 'train':
+            print(f"Created {len(image_files) * (num_augmentations + 1)} training images from {len(image_files)} originals")
+        else:
+            print(f"Copied {len(image_files)} {split} images")
+
 def download_blob(args):
     """Worker function to download a single blob."""
     blob_name, connection_string, container_name, local_dir = args
@@ -198,6 +304,14 @@ def main():
 
     # Create/update data.yaml
     data_yaml_path = create_data_yaml(LOCAL_DATA_DIR)
+    print(f"Data configuration file: {data_yaml_path}")
+
+    augment_dataset_10x_yolo_format(
+        source_dir=LOCAL_DATA_DIR,
+        output_dir=LOCAL_DATA_DIR + "_10x"
+    )
+
+    data_yaml_path = LOCAL_DATA_DIR + "_10x" + "/data.yaml"
     print(f"Data configuration file: {data_yaml_path}")
 
     model = YOLO('yolo11x-seg.pt')
