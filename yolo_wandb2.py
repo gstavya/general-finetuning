@@ -14,9 +14,17 @@ import json
 import time
 import wandb
 from wandb.integration.ultralytics import add_wandb_callback
+from ultralytics import settings
+settings.update({'wandb': True})
+
 
 # Set YOLO config directory to avoid permission warnings
 os.environ['YOLO_CONFIG_DIR'] = '/tmp/yolo_config'
+os.environ['WANDB_API_KEY'] = 'dab85e8256791ddd93e4b37ecd163130376f7ffc'
+
+wandb.login(key="dab85e8256791ddd93e4b37ecd163130376f7ffc")
+
+wandb.init(project="ultralytics", name="yolo-sidewalk-training")
 
 # Suppress Ultralytics warnings during multiprocessing
 warnings.filterwarnings('ignore', message='user config directory')
@@ -164,10 +172,10 @@ def create_data_yaml(local_data_dir):
 def main():
     # --- Configuration ---
     SOURCE_DATA_CONTAINER = "13ksidewalk60"
-    CHECKPOINT_CONTAINER = "13ksidewalk60yolotest"
+    CHECKPOINT_CONTAINER = "13ksidewalk60yolo"
     LOCAL_DATA_DIR = "/mnt/data/yolo_sidewalk"
-    NUM_EPOCHS = 50
-    BATCH_SIZE = 256
+    NUM_EPOCHS = 300
+    BATCH_SIZE = 512
     DEVICE = '0,1,2,3'
 
     # Create YOLO config directory
@@ -192,126 +200,45 @@ def main():
     data_yaml_path = create_data_yaml(LOCAL_DATA_DIR)
     print(f"Data configuration file: {data_yaml_path}")
 
-    # Initialize variables for checkpoint loading
-    start_epoch = 0
-    resume_path = False
-    model = None
-
-    # Check for existing checkpoint in Azure (for resumption)
-    print(f"Checking for existing checkpoints in Azure container '{CHECKPOINT_CONTAINER}' for resumption...")
-    try:
-        blob_service_client = BlobServiceClient.from_connection_string(connection_string)
-        container_client = blob_service_client.get_container_client(CHECKPOINT_CONTAINER)
-
-        latest_checkpoint_to_load = None
-        
-        # Prioritize 'latest_resume_checkpoint.pth' if present for direct loading
-        latest_pt_blob = next((blob.name for blob in container_client.list_blobs() if blob.name == 'latest_resume_checkpoint.pth'), None)
-        
-        if latest_pt_blob:
-            latest_checkpoint_to_load = latest_pt_blob
-            print(f"Found 'latest_resume_checkpoint.pth' for direct resumption.")
-        else:
-            # Fallback to finding the highest epoch tar file if no direct .pt blob
-            checkpoint_tar_blobs = [blob.name for blob in container_client.list_blobs() if blob.name.startswith('checkpoint_epoch_') and blob.name.endswith('.tar')]
-            if checkpoint_tar_blobs:
-                checkpoint_tar_blobs.sort(key=lambda x: int(x.split('_')[2].split('.')[0]))
-                latest_checkpoint_to_load = checkpoint_tar_blobs[-1]
-                print(f"Found latest epoch checkpoint tar: {latest_checkpoint_to_load}")
-        
-        if latest_checkpoint_to_load:
-            with tempfile.TemporaryDirectory() as temp_dir_for_resume:
-                extracted_weights_path = download_and_extract_checkpoint(
-                    connection_string, CHECKPOINT_CONTAINER, latest_checkpoint_to_load, temp_dir_for_resume
-                )
-                if extracted_weights_path and os.path.exists(extracted_weights_path):
-                    model = YOLO(extracted_weights_path)
-                    # Try to infer start_epoch if from a tar file, assuming naming convention
-                    if latest_checkpoint_to_load.startswith('checkpoint_epoch_'):
-                        try:
-                            start_epoch = int(latest_checkpoint_to_load.split('_')[2].split('.')[0])
-                            print(f"Resuming training from epoch {start_epoch}.")
-                        except ValueError:
-                            print("Could not parse epoch from checkpoint name. Resuming from 0.")
-                    resume_path = extracted_weights_path # Set resume path for Ultralytics
-                else:
-                    print("Failed to get weights path from extracted checkpoint. Starting from scratch...")
-                    model = YOLO('yolov11n-seg.pt')
-        else:
-            print("No checkpoints found, starting from scratch...")
-            model = YOLO('yolov11n-seg.pt')
-
-    except Exception as e:
-        print(f"Error checking for checkpoints: {e}")
-        print("Starting training from scratch...")
-        model = YOLO('yolov11n-seg.pt')
-
+    model = YOLO('yolo11x-seg.pt')
     add_wandb_callback(model, enable_model_checkpointing=True)
 
-    with tempfile.TemporaryDirectory() as temp_project_dir:
-        remaining_epochs = NUM_EPOCHS - start_epoch
+    results = model.train(
+        data=data_yaml_path, 
+        epochs=NUM_EPOCHS, 
+        imgsz=640, 
+        plots=True, 
+        val=True,
+        project="ultralytics",
+        name="yolo-sidewalk-run"
+    )
+    print("\nSaving final model to Azure...")
 
-        if remaining_epochs <= 0:
-            print(f"Training already completed ({start_epoch} epochs done, target was {NUM_EPOCHS})")
-            return
+    best_model_path = Path(results.save_dir, "weights", "best.pt")
+    
+    blob_service_client = BlobServiceClient.from_connection_string(connection_string)
 
-        print(f"\nStarting training from epoch {start_epoch + 1} to {NUM_EPOCHS}...")
-        print(f"Training for {remaining_epochs} more epochs...")
-
-        train_args = {
-            'data': data_yaml_path,
-            'epochs': remaining_epochs,
-            'batch': BATCH_SIZE,
-            'imgsz': 640,
-            'device': DEVICE,
-            'workers': 8,
-            'save': True, # Keep True so Ultralytics saves 'last.pt' and 'best.pt'
-            'save_period': -1, # Disable periodic saving by Ultralytics
-            'project': temp_project_dir, # Use a temporary directory for output
-            'name': 'yolov11n_seg_sidewalk_run', # A simple name for Ultralytics' internal run folder
-            'exist_ok': True,
-            'pretrained': False,
-            'resume': resume_path if resume_path else False, # Pass path for resuming
-            'optimizer': 'auto',
-            'verbose': False, # Set verbose to False to suppress training loss output
-            'seed': 42,
-            'deterministic': True,
-            'single_cls': True,
-            'amp': True,
-            'plots': False, # Disable plotting to reduce output and dependencies
-            # Augmentation parameters
-            'hsv_h': 0.015, 'hsv_s': 0.7, 'hsv_v': 0.4, 'degrees': 0.0, 'translate': 0.1,
-            'scale': 0.5, 'shear': 0.0, 'perspective': 0.0, 'flipud': 0.0, 'fliplr': 0.5,
-            'mosaic': 1.0, 'mixup': 0.0, 'copy_paste': 0.0,
-            # Segmentation specific
-            'overlap_mask': True, 'mask_ratio': 4,
-        }
-
-        # Train the model silently, only the final result is of interest
-        results = model.train(**train_args)
-
-        # --- Save only the final model to Azure ---
-        print("\nSaving final model to Azure...")
-
-        final_blob_name = "yolov11n_seg_sidewalk_final.pt"
-        # Ultralytics saves the last model in its run directory, specifically:
-        # {temp_project_dir}/{name}/weights/last.pt
-        final_model_path_local = os.path.join(temp_project_dir, train_args['name'], 'weights', 'last.pt')
-        
-        if os.path.exists(final_model_path_local):
-            try:
-                blob_service_client = BlobServiceClient.from_connection_string(connection_string)
+    for i in range(NUM_EPOCHS):
+        if i % 5 == 0:
+            model_path = Path(results.save_dir, "weights", f"epoch{i}.pt")
+            if model_path.exists():
                 blob_client = blob_service_client.get_blob_client(
                     container=CHECKPOINT_CONTAINER,
-                    blob=final_blob_name
+                    blob=f"yolo11x_seg_sidewalk_epoch{i}.pt"
                 )
-                with open(final_model_path_local, "rb") as data:
+                with open(model_path, "rb") as data:
                     blob_client.upload_blob(data, overwrite=True)
-                print(f"✅ Final trained model uploaded to Azure as: {final_blob_name}")
-            except Exception as e:
-                print(f"Failed to upload final model to Azure: {e}")
-        else:
-            print(f"❌ Error: Final model weights not found at {final_model_path_local}.")
+                print(f"✅ Epoch {i} model uploaded to Azure")
+    
+    # Upload best model
+    if best_model_path.exists():
+        blob_client = blob_service_client.get_blob_client(
+            container=CHECKPOINT_CONTAINER,
+            blob="yolo11x_seg_sidewalk_final_best.pt"
+        )
+        with open(best_model_path, "rb") as data:
+            blob_client.upload_blob(data, overwrite=True)
+        print(f"✅ Best model uploaded to Azure")
 
     print("\n✅ Training complete! Final model saved.")
     wandb.finish()
