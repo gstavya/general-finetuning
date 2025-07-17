@@ -350,9 +350,8 @@ def main_worker(rank, world_size):
             total_train_loss += loss.item()
 
             loss.backward()
-            optimizer.step()
-
             update_moving_average(target_network, online_network.module, decay=current_ema_decay)
+            optimizer.step()
 
         avg_train_loss = total_train_loss / len(train_loader)
         train_loss_tensor = torch.tensor(avg_train_loss).to(DEVICE)
