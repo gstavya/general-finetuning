@@ -15,16 +15,10 @@ import time
 import wandb
 from wandb.integration.ultralytics import add_wandb_callback
 from ultralytics import settings
-settings.update({'wandb': True})
 
 
 # Set YOLO config directory to avoid permission warnings
 os.environ['YOLO_CONFIG_DIR'] = '/tmp/yolo_config'
-os.environ['WANDB_API_KEY'] = 'dab85e8256791ddd93e4b37ecd163130376f7ffc'
-
-wandb.login(key="dab85e8256791ddd93e4b37ecd163130376f7ffc")
-
-wandb.init(project="ultralytics", name="yolo-sidewalk-training")
 
 # Suppress Ultralytics warnings during multiprocessing
 warnings.filterwarnings('ignore', message='user config directory')
@@ -313,6 +307,14 @@ def main():
 
     # data_yaml_path = "/mnt/data/yolo_sidewalk_10x/data.yaml"
     # print(f"Data configuration file: {data_yaml_path}")
+
+    settings.update({'wandb': True})
+
+    os.environ['WANDB_API_KEY'] = 'dab85e8256791ddd93e4b37ecd163130376f7ffc'
+    
+    wandb.login(key="dab85e8256791ddd93e4b37ecd163130376f7ffc")
+    
+    wandb.init(project="ultralytics", name="yolo-sidewalk-training")
 
     model = YOLO('yolo11n-seg.pt')
     add_wandb_callback(model, enable_model_checkpointing=True)
