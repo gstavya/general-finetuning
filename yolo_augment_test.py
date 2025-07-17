@@ -298,17 +298,38 @@ def main():
         local_dir=LOCAL_DATA_DIR
     )
 
-    # Create/update data.yaml
     data_yaml_path = create_data_yaml(LOCAL_DATA_DIR)
     print(f"Data configuration file: {data_yaml_path}")
 
-    # augment_dataset_10x_yolo_format(
-    #     source_dir="/mnt/data/yolo_sidewalk",
-    #     output_dir="/mnt/data/yolo_sidewalk_10x"
-    # )
+    print("\n=== Checking downloaded data structure ===")
 
-    # data_yaml_path = "/mnt/data/yolo_sidewalk_10x/data.yaml"
-    # print(f"Data configuration file: {data_yaml_path}")
+    # Check if directories exist
+    for split in ['train', 'val', 'test']:
+        img_dir = Path(LOCAL_DATA_DIR) / split / 'images'
+        lbl_dir = Path(LOCAL_DATA_DIR) / split / 'labels'
+        
+        if img_dir.exists():
+            num_images = len(list(img_dir.glob('*.jpg')) + list(img_dir.glob('*.png')))
+            print(f"{split}/images: {num_images} images found")
+        else:
+            print(f"WARNING: {split}/images directory not found!")
+        
+        if lbl_dir.exists():
+            num_labels = len(list(lbl_dir.glob('*.txt')))
+            print(f"{split}/labels: {num_labels} labels found")
+        else:
+            print(f"WARNING: {split}/labels directory not found!")
+    
+    # Check disk space
+    import shutil
+    total, used, free = shutil.disk_usage("/")
+    print(f"\nDisk space: {free // (2**30)} GB free")
+    
+    # Check data.yaml
+    if os.path.exists(data_yaml_path):
+        with open(data_yaml_path, 'r') as f:
+            print(f"\ndata.yaml content:")
+            print(yaml.safe_load(f))
 
     model = YOLO('yolo11n-seg.pt')
     add_wandb_callback(model, enable_model_checkpointing=True)
