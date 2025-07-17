@@ -307,11 +307,11 @@ def main():
     print(f"Data configuration file: {data_yaml_path}")
 
     augment_dataset_10x_yolo_format(
-        source_dir=LOCAL_DATA_DIR,
-        output_dir=LOCAL_DATA_DIR + "_10x"
+        source_dir="/mnt/data/yolo_sidewalk",
+        output_dir="/mnt/data/yolo_sidewalk_10x"
     )
 
-    data_yaml_path = LOCAL_DATA_DIR + "_10x" + "/data.yaml"
+    data_yaml_path = "/mnt/data/yolo_sidewalk_10x/data.yaml"
     print(f"Data configuration file: {data_yaml_path}")
 
     model = YOLO('yolo11x-seg.pt')
