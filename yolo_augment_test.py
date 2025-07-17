@@ -340,7 +340,7 @@ def main():
         imgsz=640, 
         plots=True, 
         val=True,
-        project="ultralytics",
+        project="sidewalk_segmentation2",
         name="yolo-sidewalk-run",
         hsv_h=0.015,       # Hue (subtle color shift)
         hsv_s=0.7,         # Saturation (strong color intensity)
