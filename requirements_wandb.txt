@@ -1,0 +1,9 @@
+pyyaml
+torch
+azure-storage-blob
+ultralytics
+tqdm
+wandb
+albumentations
+opencv-python
+numpy
