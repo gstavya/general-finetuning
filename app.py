@@ -157,7 +157,7 @@ def main_worker(rank, world_size):
     LOCAL_PATCH_CACHE_DIR = 'data'
     LOCAL_MODEL_OUTPUT_DIR = 'satellite-resnet2'
     PATCH_SIZE = 224
-    BATCH_SIZE = 128  # Divide batch size by number of GPUs
+    BATCH_SIZE = 512  # This is now the total batch size since we're using 1 GPU
     NUM_EPOCHS = 100
     DEVICE = f'cuda:{rank}'  # Each process uses its own GPU
     torch.cuda.set_device(rank)
@@ -179,7 +179,7 @@ def main_worker(rank, world_size):
         raise ValueError("Azure Storage connection string is not set.")
 
     if rank == 0:
-        print(f"Using {world_size} GPUs with DDP")
+        print(f"Using {world_size} GPU(s) with DDP")
         print(f"Per-GPU batch size: {BATCH_SIZE}")
         print(f"Total effective batch size: {BATCH_SIZE * world_size}")
         print(f"Scaled learning rate: {LR}")
@@ -496,7 +496,14 @@ def main_worker(rank, world_size):
     cleanup()
 
 def main():
-    world_size = 1  # Number of GPUs
+    # Check how many GPUs are available
+    n_gpus = torch.cuda.device_count()
+    if n_gpus == 0:
+        raise RuntimeError("No GPUs available. This script requires at least 1 GPU.")
+    
+    world_size = n_gpus  # Use all available GPUs
+    print(f"Found {world_size} GPU(s). Using all of them for training.")
+    
     import torch.multiprocessing as mp
     mp.set_start_method('spawn', force=True)
     mp.spawn(main_worker, args=(world_size,), nprocs=world_size, join=True)
