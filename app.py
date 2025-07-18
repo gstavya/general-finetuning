@@ -496,7 +496,7 @@ def main_worker(rank, world_size):
     cleanup()
 
 def main():
-    world_size = 4  # Number of GPUs
+    world_size = 1  # Number of GPUs
     import torch.multiprocessing as mp
     mp.set_start_method('spawn', force=True)
     mp.spawn(main_worker, args=(world_size,), nprocs=world_size, join=True)
