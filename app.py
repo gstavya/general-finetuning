@@ -144,12 +144,17 @@ def update_moving_average(ema_model, model, decay):
 def setup(rank, world_size):
     os.environ['MASTER_ADDR'] = 'localhost'
     os.environ['MASTER_PORT'] = '12355'
+    # Explicitly set CUDA_VISIBLE_DEVICES to ensure proper GPU mapping
     dist.init_process_group("nccl", rank=rank, world_size=world_size)
+    # Explicitly set the device
+    torch.cuda.set_device(rank)
 
 def cleanup():
     dist.destroy_process_group()
 
 def main_worker(rank, world_size):
+    # Verify we're using the correct GPU
+    print(f"Rank {rank} using GPU {rank}")
     setup(rank, world_size)
 
     # --- Configuration ---
@@ -157,12 +162,12 @@ def main_worker(rank, world_size):
     LOCAL_PATCH_CACHE_DIR = 'data_patches'  # Changed to separate directory for patches
     LOCAL_MODEL_OUTPUT_DIR = 'satellite-resnet2'
     PATCH_SIZE = 224
-    BATCH_SIZE = 512  # This is now the total batch size since we're using 1 GPU
+    BATCH_SIZE = 128  # Reduced per-GPU batch size for 4 GPUs
     NUM_EPOCHS = 100
-    DEVICE = f'cuda:{rank}'  # Each process uses its own GPU
+    DEVICE = f'cuda:{rank}'  # Each process uses its own GPU (0, 1, 2, or 3)
     torch.cuda.set_device(rank)
     DATALOADER_WORKERS = 4
-    LR = 1e-3 * world_size  # Scale learning rate with number of GPUs
+    LR = 1e-3 * world_size  # Scale learning rate with number of GPUs (4e-3 for 4 GPUs)
     VAL_SPLIT = 0.1
     TEST_SPLIT = 0.1
 
@@ -179,7 +184,7 @@ def main_worker(rank, world_size):
         raise ValueError("Azure Storage connection string is not set.")
 
     if rank == 0:
-        print(f"Using {world_size} GPU(s) with DDP")
+        print(f"Using {world_size} GPUs with DDP (devices: 0, 1, 2, 3)")
         print(f"Per-GPU batch size: {BATCH_SIZE}")
         print(f"Total effective batch size: {BATCH_SIZE * world_size}")
         print(f"Scaled learning rate: {LR}")
@@ -350,8 +355,10 @@ def main_worker(rank, world_size):
             total_train_loss += loss.item()
 
             loss.backward()
-            update_moving_average(target_network, online_network.module, decay=current_ema_decay)
             optimizer.step()
+            
+            # Update target network after optimizer step to avoid in-place operation issues
+            update_moving_average(target_network, online_network.module, decay=current_ema_decay)
 
         avg_train_loss = total_train_loss / len(train_loader)
         train_loss_tensor = torch.tensor(avg_train_loss).to(DEVICE)
@@ -496,13 +503,23 @@ def main_worker(rank, world_size):
     cleanup()
 
 def main():
-    # Check how many GPUs are available
+    # Explicitly check for exactly 4 GPUs
     n_gpus = torch.cuda.device_count()
-    if n_gpus == 0:
-        raise RuntimeError("No GPUs available. This script requires at least 1 GPU.")
+    if n_gpus < 4:
+        raise RuntimeError(f"This script requires exactly 4 GPUs, but found {n_gpus}. Please ensure CUDA devices 0, 1, 2, and 3 are available.")
     
-    world_size = n_gpus  # Use all available GPUs
-    print(f"Found {world_size} GPU(s). Using all of them for training.")
+    # Explicitly set to use 4 GPUs
+    world_size = 4
+    print(f"Found {n_gpus} GPU(s). Using 4 GPUs (devices: 0, 1, 2, 3) for training.")
+    
+    # Verify each GPU is accessible
+    for i in range(4):
+        try:
+            torch.cuda.set_device(i)
+            torch.cuda.get_device_name(i)
+            print(f"✓ GPU {i}: {torch.cuda.get_device_name(i)}")
+        except Exception as e:
+            raise RuntimeError(f"Cannot access GPU {i}. Error: {e}")
     
     import torch.multiprocessing as mp
     mp.set_start_method('spawn', force=True)
