@@ -154,7 +154,7 @@ def main_worker(rank, world_size):
 
     # --- Configuration ---
     SOURCE_DATA_CONTAINER = "data"
-    LOCAL_PATCH_CACHE_DIR = 'data'
+    LOCAL_PATCH_CACHE_DIR = 'data_patches'  # Changed to separate directory for patches
     LOCAL_MODEL_OUTPUT_DIR = 'satellite-resnet2'
     PATCH_SIZE = 224
     BATCH_SIZE = 512  # This is now the total batch size since we're using 1 GPU
