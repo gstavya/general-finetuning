@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torchvision.transforms as transforms
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, random_split
 from torchvision.models import resnet18
 from lightly.loss import NegativeCosineSimilarity
 from lightly.models.modules import BYOLPredictionHead, BYOLProjectionHead
@@ -46,14 +46,17 @@ def update_moving_average(ema_model, model, decay=0.99):
             ema_param.data = decay * ema_param.data + (1 - decay) * param.data
 
 def main():
-    # Initialize wandb
+    # Initialize wandb (will prompt for login on first run)
     wandb.init(project="byol-simple", config={
         "batch_size": 32,
         "epochs": 10,
         "learning_rate": 1e-3,
         "patch_size": 224,
         "ema_decay": 0.99,
-        "data_dir": "resnet-data"
+        "data_dir": "resnet-data",
+        "train_split": 0.8,
+        "val_split": 0.1,
+        "test_split": 0.1
     })
     config = wandb.config
     
@@ -80,9 +83,29 @@ def main():
     dataset = PatchDataset(config.data_dir, patch_size=config.patch_size, 
                           transform=TwoViewTransform(transform))
     print(f"Total patches: {len(dataset)}")
-    wandb.log({"total_patches": len(dataset)})
     
-    dataloader = DataLoader(dataset, batch_size=config.batch_size, shuffle=True, 
+    # Split dataset into train/val/test
+    total_size = len(dataset)
+    train_size = int(config.train_split * total_size)
+    val_size = int(config.val_split * total_size)
+    test_size = total_size - train_size - val_size
+    
+    train_dataset, val_dataset, test_dataset = random_split(
+        dataset, [train_size, val_size, test_size],
+        generator=torch.Generator().manual_seed(42)
+    )
+    
+    print(f"Train: {len(train_dataset)}, Val: {len(val_dataset)}, Test: {len(test_dataset)}")
+    wandb.log({
+        "total_patches": total_size,
+        "train_patches": len(train_dataset),
+        "val_patches": len(val_dataset),
+        "test_patches": len(test_dataset)
+    })
+    
+    train_loader = DataLoader(train_dataset, batch_size=config.batch_size, shuffle=True, 
+                             num_workers=4, pin_memory=True)
+    val_loader = DataLoader(val_dataset, batch_size=config.batch_size, shuffle=False,
                            num_workers=4, pin_memory=True)
     
     # Create BYOL model
@@ -108,9 +131,15 @@ def main():
     wandb.watch(online_network, criterion, log="all")
     
     # Training loop
+    best_val_loss = float('inf')
+    
     for epoch in range(config.epochs):
-        total_loss = 0
-        for batch_idx, ((view1, view2), _) in enumerate(dataloader):
+        # Training phase
+        online_network.train()
+        prediction_head.train()
+        total_train_loss = 0
+        
+        for batch_idx, ((view1, view2), _) in enumerate(train_loader):
             view1, view2 = view1.to(device), view2.to(device)
             
             # Forward pass
@@ -135,15 +164,50 @@ def main():
             # Update target network
             update_moving_average(target_network, online_network, config.ema_decay)
             
-            total_loss += loss.item()
+            total_train_loss += loss.item()
             
             if batch_idx % 10 == 0:
                 wandb.log({"batch_loss": loss.item()})
         
+        # Validation phase
+        online_network.eval()
+        prediction_head.eval()
+        total_val_loss = 0
+        
+        with torch.no_grad():
+            for (view1, view2), _ in val_loader:
+                view1, view2 = view1.to(device), view2.to(device)
+                
+                z1_online = online_network(view1)
+                z2_online = online_network(view2)
+                z1_target = target_network(view1)
+                z2_target = target_network(view2)
+                p1 = prediction_head(z1_online)
+                p2 = prediction_head(z2_online)
+                
+                val_loss = 0.5 * (criterion(p1, z2_target) + criterion(p2, z1_target))
+                total_val_loss += val_loss.item()
+        
         # Log epoch metrics
-        avg_loss = total_loss / len(dataloader)
-        wandb.log({"epoch": epoch + 1, "avg_loss": avg_loss})
-        print(f"Epoch {epoch+1}/{config.epochs}, Loss: {avg_loss:.4f}")
+        avg_train_loss = total_train_loss / len(train_loader)
+        avg_val_loss = total_val_loss / len(val_loader)
+        
+        wandb.log({
+            "epoch": epoch + 1, 
+            "train_loss": avg_train_loss,
+            "val_loss": avg_val_loss
+        })
+        
+        print(f"Epoch {epoch+1}/{config.epochs}, Train Loss: {avg_train_loss:.4f}, Val Loss: {avg_val_loss:.4f}")
+        
+        # Save best model
+        if avg_val_loss < best_val_loss:
+            best_val_loss = avg_val_loss
+            torch.save({
+                'backbone': online_network[0].state_dict(),
+                'full_model': online_network.state_dict(),
+                'epoch': epoch
+            }, "best_model.pth")
     
     # Save final model
     torch.save(online_network[0].state_dict(), "backbone.pth")
