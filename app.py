@@ -70,7 +70,7 @@ def preprocess_and_save_locally(connection_string, source_container, local_targe
     try:
         blob_service_client = BlobServiceClient.from_connection_string(connection_string)
         container_client = blob_service_client.get_container_client(source_container)
-        image_blobs = [blob.name for blob in container_client.list_blobs() if blob.name.lower().endswith(('jpg', 'jpeg', 'png'))]
+        image_blobs = [blob.name for blob in container_client.list_blobs(name_starts_with='data/') if blob.name.lower().endswith(('jpg', 'jpeg', 'png'))]
         if not image_blobs:
             print(f"Warning: No images found in source container '{source_container}'.")
             return
@@ -115,11 +115,11 @@ def update_moving_average(ema_model, model, decay):
 
 def main():
     # --- Configuration ---
-    SOURCE_DATA_CONTAINER = "data"
-    LOCAL_PATCH_CACHE_DIR = '/mnt/data'
-    LOCAL_MODEL_OUTPUT_DIR = '/mnt/satellite-resnet2'
+    SOURCE_DATA_CONTAINER = "resnet"
+    LOCAL_PATCH_CACHE_DIR = 'resnet-data'
+    LOCAL_MODEL_OUTPUT_DIR = 'resnet-output'
     PATCH_SIZE = 224
-    BATCH_SIZE = 256
+    BATCH_SIZE = 512
     NUM_EPOCHS = 100
     DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
     DATALOADER_WORKERS = 4 if torch.cuda.is_available() else 0
@@ -129,7 +129,7 @@ def main():
     VAL_SPLIT = 0.1
     TEST_SPLIT = 0.1
 
-    connection_string = "DefaultEndpointsProtocol=https;AccountName=resnettrainingdata;AccountKey=afq0lgt0sj3lq1+b3Y6eeIg+JArkqE5UJL7tHSeM+Bxa0S3aQSK9ZRMZHozG1PJx2rGfwBh7DySr+ASt3w6JmA==;EndpointSuffix=core.windows.net"
+    connection_string = "DefaultEndpointsProtocol=https;AccountName=waypointtransit;AccountKey=65dhRHnC5SzoXBuf7XkiooDgoIinVGvwn4C3SZ8vkiH1Duqz6UMXT7ASuWSIGlRsDLZ7BOyt20cp+AStwkMVkg==;EndpointSuffix=core.windows.net"
     if not connection_string:
         raise ValueError("Azure Storage connection string is not set.")
 
