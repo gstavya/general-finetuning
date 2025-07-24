@@ -19,30 +19,52 @@ class PatchDataset(Dataset):
         self.patches = []
         
         # Connect to Azure
+        print(f"\n🔌 Connecting to Azure Storage...")
+        print(f"   Container: {azure_container}")
         blob_service_client = BlobServiceClient.from_connection_string(connection_string)
         container_client = blob_service_client.get_container_client(azure_container)
         
         # Process all images from Azure
-        print("Loading images from Azure...")
+        print("\n📥 Listing blobs in container...")
         blobs = [b.name for b in container_client.list_blobs() 
                 if b.name.lower().endswith(('.jpg', '.jpeg', '.png'))]
         
-        for blob_name in blobs:
+        print(f"   Found {len(blobs)} images to process")
+        
+        total_patches = 0
+        for i, blob_name in enumerate(blobs):
             try:
+                print(f"\n🖼️  Processing image {i+1}/{len(blobs)}: {blob_name}")
+                
                 # Download image from Azure
                 blob_client = container_client.get_blob_client(blob_name)
                 image_bytes = blob_client.download_blob().readall()
                 img = Image.open(io.BytesIO(image_bytes)).convert('RGB')
                 width, height = img.size
+                print(f"   Image size: {width}x{height}")
+                
+                # Calculate number of patches
+                patches_x = (width - patch_size) // patch_size + 1
+                patches_y = (height - patch_size) // patch_size + 1
+                patches_per_image = patches_x * patches_y
+                print(f"   Extracting {patches_per_image} patches ({patches_x}x{patches_y} grid)")
                 
                 # Extract 224x224 patches
+                patch_count = 0
                 for y in range(0, height - patch_size + 1, patch_size):
                     for x in range(0, width - patch_size + 1, patch_size):
                         patch = img.crop((x, y, x + patch_size, y + patch_size))
                         self.patches.append(patch)
+                        patch_count += 1
+                
+                total_patches += patch_count
+                print(f"   ✅ Successfully extracted {patch_count} patches")
                         
             except Exception as e:
-                print(f"Error processing {blob_name}: {e}")
+                print(f"   ❌ Error processing {blob_name}: {e}")
+        
+        print(f"\n📊 Total patches created: {total_patches}")
+        print("="*60)
     
     def __len__(self):
         return len(self.patches)
@@ -95,6 +117,8 @@ def main():
             return self.transform(x), self.transform(x)
     
     # Load dataset with patches
+    print("\n🚀 Starting BYOL Training Pipeline")
+    print("="*60)
     print("Creating patches from Azure images...")
     dataset = PatchDataset(
         azure_container=config.azure_container,
@@ -102,20 +126,31 @@ def main():
         patch_size=config.patch_size, 
         transform=TwoViewTransform(transform)
     )
-    print(f"Total patches: {len(dataset)}")
+    print(f"\n✅ Dataset creation complete!")
+    print(f"   Total patches available: {len(dataset)}")
     
     # Split dataset into train/val/test
+    print("\n🔀 Splitting dataset...")
     total_size = len(dataset)
     train_size = int(config.train_split * total_size)
     val_size = int(config.val_split * total_size)
     test_size = total_size - train_size - val_size
+    
+    print(f"   Calculating splits:")
+    print(f"   - {config.train_split*100:.0f}% train = {train_size} patches")
+    print(f"   - {config.val_split*100:.0f}% val = {val_size} patches")
+    print(f"   - {config.test_split*100:.0f}% test = {test_size} patches")
     
     train_dataset, val_dataset, test_dataset = random_split(
         dataset, [train_size, val_size, test_size],
         generator=torch.Generator().manual_seed(42)
     )
     
-    print(f"Train: {len(train_dataset)}, Val: {len(val_dataset)}, Test: {len(test_dataset)}")
+    print(f"\n✅ Dataset split complete!")
+    print(f"   Train: {len(train_dataset)} patches")
+    print(f"   Val: {len(val_dataset)} patches")
+    print(f"   Test: {len(test_dataset)} patches")
+    print("="*60)
     wandb.log({
         "total_patches": total_size,
         "train_patches": len(train_dataset),
@@ -127,6 +162,11 @@ def main():
                              num_workers=4, pin_memory=True)
     val_loader = DataLoader(val_dataset, batch_size=config.batch_size, shuffle=False,
                            num_workers=4, pin_memory=True)
+    
+    print(f"\n🔧 Initializing model on {device.upper()}")
+    print(f"   Batch size: {config.batch_size}")
+    print(f"   Learning rate: {config.learning_rate}")
+    print(f"   Epochs: {config.epochs}")
     
     # Create BYOL model
     backbone = resnet18(pretrained=False)
@@ -140,6 +180,8 @@ def main():
     target_network = copy.deepcopy(online_network).to(device)
     prediction_head = BYOLPredictionHead(256, 4096, 256).to(device)
     
+    print("   ✅ Model initialized successfully!")
+    
     # Setup optimizer and loss
     optimizer = torch.optim.Adam(
         list(online_network.parameters()) + list(prediction_head.parameters()), 
@@ -149,16 +191,23 @@ def main():
     
     # Watch model
     wandb.watch(online_network, criterion, log="all")
+    print("   ✅ Connected to Weights & Biases")
+    print("="*60)
     
     # Training loop
+    print("\n🏃 Starting training...")
     best_val_loss = float('inf')
     
     for epoch in range(config.epochs):
+        print(f"\n📈 Epoch {epoch+1}/{config.epochs}")
+        print("-"*40)
+        
         # Training phase
         online_network.train()
         prediction_head.train()
         total_train_loss = 0
         
+        print(f"Training on {len(train_loader)} batches...")
         for batch_idx, ((view1, view2), _) in enumerate(train_loader):
             view1, view2 = view1.to(device), view2.to(device)
             
@@ -188,8 +237,10 @@ def main():
             
             if batch_idx % 10 == 0:
                 wandb.log({"batch_loss": loss.item()})
+                print(f"   Batch [{batch_idx}/{len(train_loader)}] Loss: {loss.item():.4f}")
         
         # Validation phase
+        print(f"\nValidating on {len(val_loader)} batches...")
         online_network.eval()
         prediction_head.eval()
         total_val_loss = 0
@@ -218,7 +269,9 @@ def main():
             "val_loss": avg_val_loss
         })
         
-        print(f"Epoch {epoch+1}/{config.epochs}, Train Loss: {avg_train_loss:.4f}, Val Loss: {avg_val_loss:.4f}")
+        print(f"\n📊 Epoch {epoch+1} Summary:")
+        print(f"   Train Loss: {avg_train_loss:.4f}")
+        print(f"   Val Loss: {avg_val_loss:.4f}")
         
         # Save best model
         if avg_val_loss < best_val_loss:
@@ -228,20 +281,30 @@ def main():
                 'full_model': online_network.state_dict(),
                 'epoch': epoch
             }, "best_model.pth")
+            print(f"   🏆 New best model saved! (Val Loss: {avg_val_loss:.4f})")
+        else:
+            print(f"   Current best Val Loss: {best_val_loss:.4f}")
     
+    
+    print("\n="*60)
+    print("✅ Training completed!")
     
     # Save final model and log as artifact
+    print("\n💾 Saving models...")
     torch.save(online_network[0].state_dict(), "final_backbone.pth")
+    print("   Saved final_backbone.pth")
     
     artifact = wandb.Artifact("byol-model", type="model")
     artifact.add_file("best_model.pth")
     artifact.add_file("final_backbone.pth")
     wandb.log_artifact(artifact)
+    print("   ✅ Models uploaded to W&B")
     
     # Test evaluation on best model
-    print("\nEvaluating on test set...")
+    print("\n🧪 Evaluating on test set...")
     checkpoint = torch.load("best_model.pth")
     online_network.load_state_dict(checkpoint['full_model'])
+    print(f"   Loaded best model from epoch {checkpoint['epoch']+1}")
     
     test_loader = DataLoader(test_dataset, batch_size=config.batch_size, shuffle=False,
                             num_workers=4, pin_memory=True)
@@ -250,6 +313,7 @@ def main():
     prediction_head.eval()
     total_test_loss = 0
     
+    print(f"   Testing on {len(test_loader)} batches...")
     with torch.no_grad():
         for (view1, view2), _ in test_loader:
             view1, view2 = view1.to(device), view2.to(device)
@@ -266,9 +330,14 @@ def main():
     
     avg_test_loss = total_test_loss / len(test_loader)
     wandb.log({"test_loss": avg_test_loss})
-    print(f"Test Loss: {avg_test_loss:.4f}")
+    
+    print(f"\n🏁 Final Results:")
+    print(f"   Best Validation Loss: {best_val_loss:.4f}")
+    print(f"   Test Loss: {avg_test_loss:.4f}")
+    print("="*60)
     
     wandb.finish()
+    print("\n👋 All done! Check your results at https://wandb.ai")
 
 if __name__ == "__main__":
     main()
