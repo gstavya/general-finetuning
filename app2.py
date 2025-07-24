@@ -1,4 +1,22 @@
-import torch
+def process_blob(args):
+    blob_name, azure_container, connection_string, patch_size = args
+    patches = []
+    try:
+        blob_service_client = BlobServiceClient.from_connection_string(connection_string)
+        container_client = blob_service_client.get_container_client(azure_container)
+        blob_client = container_client.get_blob_client(blob_name)
+        image_bytes = blob_client.download_blob().readall()
+        img = Image.open(io.BytesIO(image_bytes)).convert('RGB')
+        width, height = img.size
+        
+        for y in range(0, height - patch_size + 1, patch_size):
+            for x in range(0, width - patch_size + 1, patch_size):
+                patch = img.crop((x, y, x + patch_size, y + patch_size))
+                patches.append(patch)
+        
+        return blob_name, patches, None
+    except Exception as e:
+        return blob_name, [], str(e)import torch
 import torch.nn as nn
 import torchvision.transforms as transforms
 from torch.utils.data import DataLoader, Dataset, random_split
@@ -12,6 +30,8 @@ import os
 import glob
 import io
 from azure.storage.blob import BlobServiceClient
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import multiprocessing
 
 class PatchDataset(Dataset):
     def __init__(self, azure_container, connection_string, patch_size=224, transform=None):
@@ -30,38 +50,22 @@ class PatchDataset(Dataset):
                 if b.name.lower().endswith(('.jpg', '.jpeg', '.png'))]
         
         print(f"   Found {len(blobs)} images to process")
+        print(f"   Using {multiprocessing.cpu_count()} CPU cores for parallel processing")
+        
+        # Process images in parallel
+        args_list = [(blob_name, azure_container, connection_string, patch_size) for blob_name in blobs]
+        
+        with multiprocessing.Pool(processes=multiprocessing.cpu_count()) as pool:
+            results = pool.map(process_blob, args_list)
         
         total_patches = 0
-        for i, blob_name in enumerate(blobs):
-            try:
-                print(f"\n🖼️  Processing image {i+1}/{len(blobs)}: {blob_name}")
-                
-                # Download image from Azure
-                blob_client = container_client.get_blob_client(blob_name)
-                image_bytes = blob_client.download_blob().readall()
-                img = Image.open(io.BytesIO(image_bytes)).convert('RGB')
-                width, height = img.size
-                print(f"   Image size: {width}x{height}")
-                
-                # Calculate number of patches
-                patches_x = (width - patch_size) // patch_size + 1
-                patches_y = (height - patch_size) // patch_size + 1
-                patches_per_image = patches_x * patches_y
-                print(f"   Extracting {patches_per_image} patches ({patches_x}x{patches_y} grid)")
-                
-                # Extract 224x224 patches
-                patch_count = 0
-                for y in range(0, height - patch_size + 1, patch_size):
-                    for x in range(0, width - patch_size + 1, patch_size):
-                        patch = img.crop((x, y, x + patch_size, y + patch_size))
-                        self.patches.append(patch)
-                        patch_count += 1
-                
-                total_patches += patch_count
-                print(f"   ✅ Successfully extracted {patch_count} patches")
-                        
-            except Exception as e:
-                print(f"   ❌ Error processing {blob_name}: {e}")
+        for blob_name, patches, error in results:
+            if error:
+                print(f"   ❌ Error processing {blob_name}: {error}")
+            else:
+                self.patches.extend(patches)
+                total_patches += len(patches)
+                print(f"   ✅ {blob_name}: {len(patches)} patches")
         
         print(f"\n📊 Total patches created: {total_patches}")
         print("="*60)
