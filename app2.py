@@ -91,14 +91,18 @@ def main():
     # Initialize wandb (will prompt for login on first run)
     wandb.init(project="byol-simple", config={
         "batch_size": 32,
-        "epochs": 10,
-        "learning_rate": 1e-3,
+        "epochs": 100,
+        "learning_rate": 3e-4,
         "patch_size": 224,
         "ema_decay": 0.99,
         "azure_container": "resnet",
         "train_split": 0.8,
         "val_split": 0.1,
-        "test_split": 0.1
+        "test_split": 0.1,
+        "weight_decay": 1e-4,
+        "patience": 10,
+        "lr_scheduler_patience": 5,
+        "lr_scheduler_factor": 0.5
     })
     config = wandb.config
     
@@ -167,7 +171,7 @@ def main():
     val_loader = DataLoader(val_dataset, batch_size=config.batch_size, shuffle=False,
                            num_workers=4, pin_memory=True)
     
-    print(f"\n🔧 Initializing model on {device.upper()}")
+    print(f"\n🔧 Initializing model on {str(device).upper()}")
     print(f"   Batch size: {config.batch_size}")
     print(f"   Learning rate: {config.learning_rate}")
     print(f"   Epochs: {config.epochs}")
@@ -189,9 +193,19 @@ def main():
     # Setup optimizer and loss
     optimizer = torch.optim.Adam(
         list(online_network.parameters()) + list(prediction_head.parameters()), 
-        lr=config.learning_rate
+        lr=config.learning_rate,
+        weight_decay=config.weight_decay  # Add L2 regularization
     )
     criterion = NegativeCosineSimilarity()
+    
+    # Add learning rate scheduler
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, 
+        mode='min', 
+        factor=config.lr_scheduler_factor, 
+        patience=config.lr_scheduler_patience,
+        verbose=True
+    )
     
     # Watch model
     wandb.watch(online_network, criterion, log="all")
@@ -201,6 +215,7 @@ def main():
     # Training loop
     print("\n🏃 Starting training...")
     best_val_loss = float('inf')
+    epochs_without_improvement = 0
     
     for epoch in range(config.epochs):
         print(f"\n📈 Epoch {epoch+1}/{config.epochs}")
@@ -267,19 +282,26 @@ def main():
         avg_train_loss = total_train_loss / len(train_loader)
         avg_val_loss = total_val_loss / len(val_loader)
         
+        # Step the learning rate scheduler
+        scheduler.step(avg_val_loss)
+        current_lr = optimizer.param_groups[0]['lr']
+        
         wandb.log({
             "epoch": epoch + 1, 
             "train_loss": avg_train_loss,
-            "val_loss": avg_val_loss
+            "val_loss": avg_val_loss,
+            "learning_rate": current_lr
         })
         
         print(f"\n📊 Epoch {epoch+1} Summary:")
         print(f"   Train Loss: {avg_train_loss:.4f}")
         print(f"   Val Loss: {avg_val_loss:.4f}")
+        print(f"   Learning Rate: {current_lr:.6f}")
         
-        # Save best model
+        # Save best model and check early stopping
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
+            epochs_without_improvement = 0
             torch.save({
                 'backbone': online_network[0].state_dict(),
                 'full_model': online_network.state_dict(),
@@ -287,7 +309,14 @@ def main():
             }, "best_model.pth")
             print(f"   🏆 New best model saved! (Val Loss: {avg_val_loss:.4f})")
         else:
-            print(f"   Current best Val Loss: {best_val_loss:.4f}")
+            epochs_without_improvement += 1
+            print(f"   No improvement for {epochs_without_improvement} epochs (best: {best_val_loss:.4f})")
+            
+            # Early stopping check
+            if epochs_without_improvement >= config.patience:
+                print(f"\n⛔ Early stopping triggered! No improvement for {config.patience} epochs.")
+                print(f"   Best validation loss: {best_val_loss:.4f}")
+                break
     
     
     print("\n="*60)
