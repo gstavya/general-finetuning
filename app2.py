@@ -10,17 +10,29 @@ import wandb
 from PIL import Image
 import os
 import glob
+import io
+from azure.storage.blob import BlobServiceClient
 
 class PatchDataset(Dataset):
-    def __init__(self, image_dir, patch_size=224, transform=None):
+    def __init__(self, azure_container, connection_string, patch_size=224, transform=None):
         self.transform = transform
         self.patches = []
         
-        # Process all images in directory
-        for img_path in glob.glob(os.path.join(image_dir, "**/*.jpg"), recursive=True) + \
-                       glob.glob(os.path.join(image_dir, "**/*.png"), recursive=True):
+        # Connect to Azure
+        blob_service_client = BlobServiceClient.from_connection_string(connection_string)
+        container_client = blob_service_client.get_container_client(azure_container)
+        
+        # Process all images from Azure
+        print("Loading images from Azure...")
+        blobs = [b.name for b in container_client.list_blobs() 
+                if b.name.lower().endswith(('.jpg', '.jpeg', '.png'))]
+        
+        for blob_name in blobs:
             try:
-                img = Image.open(img_path).convert('RGB')
+                # Download image from Azure
+                blob_client = container_client.get_blob_client(blob_name)
+                image_bytes = blob_client.download_blob().readall()
+                img = Image.open(io.BytesIO(image_bytes)).convert('RGB')
                 width, height = img.size
                 
                 # Extract 224x224 patches
@@ -28,8 +40,9 @@ class PatchDataset(Dataset):
                     for x in range(0, width - patch_size + 1, patch_size):
                         patch = img.crop((x, y, x + patch_size, y + patch_size))
                         self.patches.append(patch)
+                        
             except Exception as e:
-                print(f"Error processing {img_path}: {e}")
+                print(f"Error processing {blob_name}: {e}")
     
     def __len__(self):
         return len(self.patches)
@@ -46,6 +59,9 @@ def update_moving_average(ema_model, model, decay=0.99):
             ema_param.data = decay * ema_param.data + (1 - decay) * param.data
 
 def main():
+    # Azure connection string
+    connection_string = "DefaultEndpointsProtocol=https;AccountName=waypointtransit;AccountKey=65dhRHnC5SzoXBuf7XkiooDgoIinVGvwn4C3SZ8vkiH1Duqz6UMXT7ASuWSIGlRsDLZ7BOyt20cp+AStwkMVkg==;EndpointSuffix=core.windows.net"
+    
     # Initialize wandb (will prompt for login on first run)
     wandb.init(project="byol-simple", config={
         "batch_size": 32,
@@ -53,7 +69,7 @@ def main():
         "learning_rate": 1e-3,
         "patch_size": 224,
         "ema_decay": 0.99,
-        "data_dir": "resnet-data",
+        "azure_container": "resnet",
         "train_split": 0.8,
         "val_split": 0.1,
         "test_split": 0.1
@@ -79,9 +95,13 @@ def main():
             return self.transform(x), self.transform(x)
     
     # Load dataset with patches
-    print("Creating patches from images...")
-    dataset = PatchDataset(config.data_dir, patch_size=config.patch_size, 
-                          transform=TwoViewTransform(transform))
+    print("Creating patches from Azure images...")
+    dataset = PatchDataset(
+        azure_container=config.azure_container,
+        connection_string=connection_string,
+        patch_size=config.patch_size, 
+        transform=TwoViewTransform(transform)
+    )
     print(f"Total patches: {len(dataset)}")
     
     # Split dataset into train/val/test
@@ -209,13 +229,44 @@ def main():
                 'epoch': epoch
             }, "best_model.pth")
     
-    # Save final model
-    torch.save(online_network[0].state_dict(), "backbone.pth")
     
-    # Log model as artifact
-    artifact = wandb.Artifact("byol-backbone", type="model")
-    artifact.add_file("backbone.pth")
+    # Save final model and log as artifact
+    torch.save(online_network[0].state_dict(), "final_backbone.pth")
+    
+    artifact = wandb.Artifact("byol-model", type="model")
+    artifact.add_file("best_model.pth")
+    artifact.add_file("final_backbone.pth")
     wandb.log_artifact(artifact)
+    
+    # Test evaluation on best model
+    print("\nEvaluating on test set...")
+    checkpoint = torch.load("best_model.pth")
+    online_network.load_state_dict(checkpoint['full_model'])
+    
+    test_loader = DataLoader(test_dataset, batch_size=config.batch_size, shuffle=False,
+                            num_workers=4, pin_memory=True)
+    
+    online_network.eval()
+    prediction_head.eval()
+    total_test_loss = 0
+    
+    with torch.no_grad():
+        for (view1, view2), _ in test_loader:
+            view1, view2 = view1.to(device), view2.to(device)
+            
+            z1_online = online_network(view1)
+            z2_online = online_network(view2)
+            z1_target = target_network(view1)
+            z2_target = target_network(view2)
+            p1 = prediction_head(z1_online)
+            p2 = prediction_head(z2_online)
+            
+            test_loss = 0.5 * (criterion(p1, z2_target) + criterion(p2, z1_target))
+            total_test_loss += test_loss.item()
+    
+    avg_test_loss = total_test_loss / len(test_loader)
+    wandb.log({"test_loss": avg_test_loss})
+    print(f"Test Loss: {avg_test_loss:.4f}")
     
     wandb.finish()
 
