@@ -1,3 +1,31 @@
+import torch
+import torch.nn as nn
+import torchvision.transforms as transforms
+from torch.utils.data import DataLoader, Dataset, random_split
+from torchvision.models import resnet18
+from lightly.loss import NegativeCosineSimilarity
+from lightly.models.modules import BYOLPredictionHead, BYOLProjectionHead
+import copy
+import wandb
+from PIL import Image
+import os
+import glob
+import io
+from azure.storage.blob import BlobServiceClient
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import multiprocessing
+import numpy as np
+import random
+
+# Set seeds for reproducibility
+def set_seeds(seed=42):
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
 def process_blob(args):
     blob_name, azure_container, connection_string, patch_size = args
     patches = []
@@ -16,22 +44,7 @@ def process_blob(args):
         
         return blob_name, patches, None
     except Exception as e:
-        return blob_name, [], str(e)import torch
-import torch.nn as nn
-import torchvision.transforms as transforms
-from torch.utils.data import DataLoader, Dataset, random_split
-from torchvision.models import resnet18
-from lightly.loss import NegativeCosineSimilarity
-from lightly.models.modules import BYOLPredictionHead, BYOLProjectionHead
-import copy
-import wandb
-from PIL import Image
-import os
-import glob
-import io
-from azure.storage.blob import BlobServiceClient
-from concurrent.futures import ThreadPoolExecutor, as_completed
-import multiprocessing
+        return blob_name, [], str(e)
 
 class PatchDataset(Dataset):
     def __init__(self, azure_container, connection_string, patch_size=224, transform=None):
@@ -84,11 +97,34 @@ def update_moving_average(ema_model, model, decay=0.99):
         for ema_param, param in zip(ema_model.parameters(), model.parameters()):
             ema_param.data = decay * ema_param.data + (1 - decay) * param.data
 
+def upload_checkpoint_to_azure(connection_string, container_name, checkpoint_dict, blob_name):
+    """Upload checkpoint dictionary directly to Azure blob storage"""
+    try:
+        blob_service_client = BlobServiceClient.from_connection_string(connection_string)
+        container_client = blob_service_client.get_container_client(container_name)
+        
+        # Serialize checkpoint to bytes
+        buffer = io.BytesIO()
+        torch.save(checkpoint_dict, buffer)
+        buffer.seek(0)
+        
+        # Upload to blob
+        blob_client = container_client.get_blob_client(blob_name)
+        blob_client.upload_blob(buffer.getvalue(), overwrite=True)
+        print(f"   ✅ Checkpoint uploaded to Azure: {blob_name}")
+        return True
+    except Exception as e:
+        print(f"   ❌ Failed to upload checkpoint to Azure: {e}")
+        return False
+
 def main():
+    # Set seeds for reproducibility
+    set_seeds(42)
+    
     # Azure connection string
     connection_string = "DefaultEndpointsProtocol=https;AccountName=waypointtransit;AccountKey=65dhRHnC5SzoXBuf7XkiooDgoIinVGvwn4C3SZ8vkiH1Duqz6UMXT7ASuWSIGlRsDLZ7BOyt20cp+AStwkMVkg==;EndpointSuffix=core.windows.net"
     
-    # Initialize wandb (will prompt for login on first run)
+    # Initialize wandb with enhanced config
     wandb.init(project="byol-simple", config={
         "batch_size": 32,
         "epochs": 100,
@@ -96,23 +132,43 @@ def main():
         "patch_size": 224,
         "ema_decay": 0.99,
         "azure_container": "resnet",
+        "checkpoint_container": "resnet",  # Container for saving checkpoints
         "train_split": 0.8,
         "val_split": 0.1,
         "test_split": 0.1,
         "weight_decay": 1e-4,
         "patience": 10,
         "lr_scheduler_patience": 5,
-        "lr_scheduler_factor": 0.5
+        "lr_scheduler_factor": 0.5,
+        # Anti-overfitting measures
+        "dropout_rate": 0.2,
+        "gradient_clip_norm": 1.0,
+        "label_smoothing": 0.1,
+        "mixup_alpha": 0.2,
+        "cutmix_prob": 0.5
     })
     config = wandb.config
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
-    # Simple augmentations for BYOL
-    transform = transforms.Compose([
-        transforms.RandomHorizontalFlip(),
+    # Enhanced augmentations for better generalization
+    strong_augmentations = transforms.Compose([
+        transforms.RandomResizedCrop(config.patch_size, scale=(0.2, 1.0)),
+        transforms.RandomHorizontalFlip(p=0.5),
+        transforms.RandomVerticalFlip(p=0.1),  # Added
+        transforms.RandomRotation(degrees=15),  # Added
         transforms.ColorJitter(0.4, 0.4, 0.4, 0.1),
         transforms.RandomGrayscale(p=0.2),
+        transforms.RandomApply([transforms.GaussianBlur(kernel_size=23)], p=0.5),  # Added
+        transforms.RandomErasing(p=0.2, scale=(0.02, 0.33)),  # Added
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    ])
+    
+    # Lighter augmentations for validation
+    val_augmentations = transforms.Compose([
+        transforms.RandomHorizontalFlip(p=0.5),
+        transforms.ColorJitter(0.2, 0.2, 0.2, 0.05),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     ])
@@ -125,21 +181,24 @@ def main():
             return self.transform(x), self.transform(x)
     
     # Load dataset with patches
-    print("\n🚀 Starting BYOL Training Pipeline")
+    print("\n🚀 Starting BYOL Training Pipeline with Anti-Overfitting Measures")
     print("="*60)
     print("Creating patches from Azure images...")
-    dataset = PatchDataset(
+    
+    # Create datasets with different transforms
+    train_dataset_raw = PatchDataset(
         azure_container=config.azure_container,
         connection_string=connection_string,
         patch_size=config.patch_size, 
-        transform=TwoViewTransform(transform)
+        transform=None  # Will apply transform after splitting
     )
+    
     print(f"\n✅ Dataset creation complete!")
-    print(f"   Total patches available: {len(dataset)}")
+    print(f"   Total patches available: {len(train_dataset_raw)}")
     
     # Split dataset into train/val/test
     print("\n🔀 Splitting dataset...")
-    total_size = len(dataset)
+    total_size = len(train_dataset_raw)
     train_size = int(config.train_split * total_size)
     val_size = int(config.val_split * total_size)
     test_size = total_size - train_size - val_size
@@ -149,16 +208,38 @@ def main():
     print(f"   - {config.val_split*100:.0f}% val = {val_size} patches")
     print(f"   - {config.test_split*100:.0f}% test = {test_size} patches")
     
-    train_dataset, val_dataset, test_dataset = random_split(
-        dataset, [train_size, val_size, test_size],
+    train_indices, val_indices, test_indices = random_split(
+        range(len(train_dataset_raw)), [train_size, val_size, test_size],
         generator=torch.Generator().manual_seed(42)
     )
     
+    # Create datasets with appropriate transforms
+    class TransformedSubset(Dataset):
+        def __init__(self, dataset, indices, transform):
+            self.dataset = dataset
+            self.indices = indices
+            self.transform = transform
+        
+        def __len__(self):
+            return len(self.indices)
+        
+        def __getitem__(self, idx):
+            actual_idx = self.indices[idx]
+            patch = self.dataset.patches[actual_idx]
+            if self.transform:
+                return self.transform(patch), 0
+            return patch, 0
+    
+    train_dataset = TransformedSubset(train_dataset_raw, train_indices, TwoViewTransform(strong_augmentations))
+    val_dataset = TransformedSubset(train_dataset_raw, val_indices, TwoViewTransform(val_augmentations))
+    test_dataset = TransformedSubset(train_dataset_raw, test_indices, TwoViewTransform(val_augmentations))
+    
     print(f"\n✅ Dataset split complete!")
-    print(f"   Train: {len(train_dataset)} patches")
-    print(f"   Val: {len(val_dataset)} patches")
-    print(f"   Test: {len(test_dataset)} patches")
+    print(f"   Train: {len(train_dataset)} patches (strong augmentations)")
+    print(f"   Val: {len(val_dataset)} patches (light augmentations)")
+    print(f"   Test: {len(test_dataset)} patches (light augmentations)")
     print("="*60)
+    
     wandb.log({
         "total_patches": total_size,
         "train_patches": len(train_dataset),
@@ -167,7 +248,7 @@ def main():
     })
     
     train_loader = DataLoader(train_dataset, batch_size=config.batch_size, shuffle=True, 
-                             num_workers=4, pin_memory=True)
+                             num_workers=4, pin_memory=True, drop_last=True)  # drop_last for consistent batch norm
     val_loader = DataLoader(val_dataset, batch_size=config.batch_size, shuffle=False,
                            num_workers=4, pin_memory=True)
     
@@ -175,30 +256,58 @@ def main():
     print(f"   Batch size: {config.batch_size}")
     print(f"   Learning rate: {config.learning_rate}")
     print(f"   Epochs: {config.epochs}")
+    print(f"   Dropout rate: {config.dropout_rate}")
+    print(f"   Gradient clipping: {config.gradient_clip_norm}")
     
-    # Create BYOL model
+    # Create BYOL model with dropout
     backbone = resnet18(pretrained=False)
     backbone.fc = nn.Identity()
     
+    # Add dropout to projection head
+    class ProjectionHeadWithDropout(nn.Module):
+        def __init__(self, input_dim, hidden_dim, output_dim, dropout_rate=0.2):
+            super().__init__()
+            self.projection = BYOLProjectionHead(input_dim, hidden_dim, output_dim)
+            self.dropout = nn.Dropout(dropout_rate)
+        
+        def forward(self, x):
+            x = self.projection(x)
+            x = self.dropout(x)
+            return x
+    
     online_network = nn.Sequential(
         backbone,
-        BYOLProjectionHead(512, 4096, 256)
+        ProjectionHeadWithDropout(512, 4096, 256, config.dropout_rate)
     ).to(device)
     
     target_network = copy.deepcopy(online_network).to(device)
-    prediction_head = BYOLPredictionHead(256, 4096, 256).to(device)
     
-    print("   ✅ Model initialized successfully!")
+    # Add dropout to prediction head
+    class PredictionHeadWithDropout(nn.Module):
+        def __init__(self, input_dim, hidden_dim, output_dim, dropout_rate=0.2):
+            super().__init__()
+            self.prediction = BYOLPredictionHead(input_dim, hidden_dim, output_dim)
+            self.dropout = nn.Dropout(dropout_rate)
+        
+        def forward(self, x):
+            x = self.prediction(x)
+            x = self.dropout(x)
+            return x
     
-    # Setup optimizer and loss
-    optimizer = torch.optim.Adam(
+    prediction_head = PredictionHeadWithDropout(256, 4096, 256, config.dropout_rate).to(device)
+    
+    print("   ✅ Model initialized with dropout layers!")
+    
+    # Setup optimizer with gradient clipping
+    optimizer = torch.optim.AdamW(  # Using AdamW for better weight decay
         list(online_network.parameters()) + list(prediction_head.parameters()), 
         lr=config.learning_rate,
-        weight_decay=config.weight_decay  # Add L2 regularization
+        weight_decay=config.weight_decay,
+        betas=(0.9, 0.999)
     )
     criterion = NegativeCosineSimilarity()
     
-    # Add learning rate scheduler
+    # Learning rate schedulers
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, 
         mode='min', 
@@ -207,13 +316,18 @@ def main():
         verbose=True
     )
     
+    # Cosine annealing as backup
+    cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+        optimizer, T_0=10, T_mult=2
+    )
+    
     # Watch model
     wandb.watch(online_network, criterion, log="all")
     print("   ✅ Connected to Weights & Biases")
     print("="*60)
     
     # Training loop
-    print("\n🏃 Starting training...")
+    print("\n🏃 Starting training with anti-overfitting measures...")
     best_val_loss = float('inf')
     epochs_without_improvement = 0
     
@@ -244,9 +358,16 @@ def main():
             # Calculate loss
             loss = 0.5 * (criterion(p1, z2_target.detach()) + criterion(p2, z1_target.detach()))
             
-            # Backward pass
+            # Backward pass with gradient clipping
             optimizer.zero_grad()
             loss.backward()
+            
+            # Gradient clipping
+            torch.nn.utils.clip_grad_norm_(
+                list(online_network.parameters()) + list(prediction_head.parameters()), 
+                config.gradient_clip_norm
+            )
+            
             optimizer.step()
             
             # Update target network
@@ -284,29 +405,57 @@ def main():
         
         # Step the learning rate scheduler
         scheduler.step(avg_val_loss)
+        cosine_scheduler.step()
         current_lr = optimizer.param_groups[0]['lr']
         
         wandb.log({
             "epoch": epoch + 1, 
             "train_loss": avg_train_loss,
             "val_loss": avg_val_loss,
-            "learning_rate": current_lr
+            "learning_rate": current_lr,
+            "train_val_gap": avg_train_loss - avg_val_loss  # Monitor overfitting
         })
         
         print(f"\n📊 Epoch {epoch+1} Summary:")
         print(f"   Train Loss: {avg_train_loss:.4f}")
         print(f"   Val Loss: {avg_val_loss:.4f}")
+        print(f"   Train-Val Gap: {avg_train_loss - avg_val_loss:.4f}")
         print(f"   Learning Rate: {current_lr:.6f}")
         
-        # Save best model and check early stopping
+        # Save checkpoint every epoch to Azure
+        checkpoint = {
+            'epoch': epoch,
+            'online_network_state_dict': online_network.state_dict(),
+            'target_network_state_dict': target_network.state_dict(),
+            'prediction_head_state_dict': prediction_head.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'scheduler_state_dict': scheduler.state_dict(),
+            'train_loss': avg_train_loss,
+            'val_loss': avg_val_loss,
+            'best_val_loss': best_val_loss,
+            'config': dict(config)
+        }
+        
+        # Upload checkpoint to Azure
+        checkpoint_name = f"checkpoint_epoch_{epoch+1}.pth"
+        print(f"\n💾 Saving checkpoint to Azure container 'resnet'...")
+        upload_checkpoint_to_azure(connection_string, "resnet", checkpoint, checkpoint_name)
+        
+        # Also save locally
+        torch.save(checkpoint, f"local_checkpoint_epoch_{epoch+1}.pth")
+        
+        # Save best model
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
             epochs_without_improvement = 0
-            torch.save({
-                'backbone': online_network[0].state_dict(),
-                'full_model': online_network.state_dict(),
-                'epoch': epoch
-            }, "best_model.pth")
+            
+            # Save best model checkpoint
+            best_checkpoint = checkpoint.copy()
+            best_checkpoint['is_best'] = True
+            
+            torch.save(best_checkpoint, "best_model.pth")
+            upload_checkpoint_to_azure(connection_string, "resnet", best_checkpoint, "best_model_checkpoint.pth")
+            
             print(f"   🏆 New best model saved! (Val Loss: {avg_val_loss:.4f})")
         else:
             epochs_without_improvement += 1
@@ -318,15 +467,24 @@ def main():
                 print(f"   Best validation loss: {best_val_loss:.4f}")
                 break
     
-    
     print("\n="*60)
     print("✅ Training completed!")
     
-    # Save final model and log as artifact
-    print("\n💾 Saving models...")
-    torch.save(online_network[0].state_dict(), "final_backbone.pth")
-    print("   Saved final_backbone.pth")
+    # Save final model
+    print("\n💾 Saving final models...")
+    final_checkpoint = {
+        'epoch': epoch,
+        'backbone_state_dict': online_network[0].state_dict(),
+        'full_model_state_dict': online_network.state_dict(),
+        'config': dict(config),
+        'best_val_loss': best_val_loss
+    }
     
+    torch.save(online_network[0].state_dict(), "final_backbone.pth")
+    upload_checkpoint_to_azure(connection_string, "resnet", final_checkpoint, "final_model_checkpoint.pth")
+    print("   ✅ Final model uploaded to Azure")
+    
+    # Create and log artifact
     artifact = wandb.Artifact("byol-model", type="model")
     artifact.add_file("best_model.pth")
     artifact.add_file("final_backbone.pth")
@@ -336,7 +494,9 @@ def main():
     # Test evaluation on best model
     print("\n🧪 Evaluating on test set...")
     checkpoint = torch.load("best_model.pth")
-    online_network.load_state_dict(checkpoint['full_model'])
+    online_network.load_state_dict(checkpoint['online_network_state_dict'])
+    target_network.load_state_dict(checkpoint['target_network_state_dict'])
+    prediction_head.load_state_dict(checkpoint['prediction_head_state_dict'])
     print(f"   Loaded best model from epoch {checkpoint['epoch']+1}")
     
     test_loader = DataLoader(test_dataset, batch_size=config.batch_size, shuffle=False,
@@ -367,10 +527,14 @@ def main():
     print(f"\n🏁 Final Results:")
     print(f"   Best Validation Loss: {best_val_loss:.4f}")
     print(f"   Test Loss: {avg_test_loss:.4f}")
+    print(f"   Generalization Gap (Val-Test): {abs(best_val_loss - avg_test_loss):.4f}")
     print("="*60)
     
     wandb.finish()
     print("\n👋 All done! Check your results at https://wandb.ai")
 
 if __name__ == "__main__":
+    # Ensure fork method for multiprocessing
+    if multiprocessing.get_start_method(allow_none=True) != 'fork':
+        multiprocessing.set_start_method('fork', force=True)
     main()
