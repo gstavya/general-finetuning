@@ -16,7 +16,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import multiprocessing
 import numpy as np
 import random
-
+Image.MAX_IMAGE_PIXELS = None
 # Set seeds for reproducibility
 def set_seeds(seed=42):
     torch.manual_seed(seed)
@@ -152,6 +152,7 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
     # Enhanced augmentations for better generalization
+    # FIXED: RandomErasing moved after ToTensor
     strong_augmentations = transforms.Compose([
         transforms.RandomResizedCrop(config.patch_size, scale=(0.2, 1.0)),
         transforms.RandomHorizontalFlip(p=0.5),
@@ -160,9 +161,9 @@ def main():
         transforms.ColorJitter(0.4, 0.4, 0.4, 0.1),
         transforms.RandomGrayscale(p=0.2),
         transforms.RandomApply([transforms.GaussianBlur(kernel_size=23)], p=0.5),  # Added
-        transforms.RandomErasing(p=0.2, scale=(0.02, 0.33)),  # Added
         transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        transforms.RandomErasing(p=0.2, scale=(0.02, 0.33))  # Moved after ToTensor
     ])
     
     # Lighter augmentations for validation
@@ -260,7 +261,7 @@ def main():
     print(f"   Gradient clipping: {config.gradient_clip_norm}")
     
     # Create BYOL model with dropout
-    backbone = resnet18(pretrained=False)
+    backbone = resnet18(weights=None)  # Updated to use weights parameter
     backbone.fc = nn.Identity()
     
     # Add dropout to projection head
@@ -312,8 +313,7 @@ def main():
         optimizer, 
         mode='min', 
         factor=config.lr_scheduler_factor, 
-        patience=config.lr_scheduler_patience,
-        verbose=True
+        patience=config.lr_scheduler_patience
     )
     
     # Cosine annealing as backup
